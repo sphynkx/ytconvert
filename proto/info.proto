@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package grpc.health.v1;
+
+// Request for Info/All
+message InfoRequest {
+  string selector = 1;
+}
+
+message InfoResponse {
+  string app_name = 1;
+  string instance_id = 2;
+  string host = 3;
+  string version = 4;
+  int64 uptime = 5;
+  map<string, string> labels = 6;
+  map<string, double> metrics = 7;
+  string build_hash = 8;
+  string build_time = 9;
+}
+
+service Info {
+  rpc All(InfoRequest) returns (InfoResponse);
+}
