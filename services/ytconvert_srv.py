@@ -38,17 +38,50 @@ def _make_error(pb2, err):
     )
 
 
+def _peer(context):
+    try:
+        return context.peer()
+    except Exception:
+        return ""
+
+
+def _md(context):
+    try:
+        return list(context.invocation_metadata() or [])
+    except Exception:
+        return []
+
+
+def _short(s, n=200):
+    s = "" if s is None else str(s)
+    if len(s) <= n:
+        return s
+    return s[:n] + "..."
+
+
 def make_converter_servicer(converter_pb2_grpc, converter_pb2, cfg, logger, job_store):
     class ConverterServicer(converter_pb2_grpc.ConverterServicer):
         def SubmitConvert(self, request, context):
+            t0 = time.time()
+            logger.info(
+                "rpc SubmitConvert peer=%s video_id=%s idem=%s variants=%d md=%s",
+                _peer(context),
+                _short(request.video_id),
+                _short(request.idempotency_key),
+                len(request.variants),
+                _md(context),
+            )
+
             video_id = (request.video_id or "").strip()
             if not video_id:
-                return converter_pb2.JobAck(
+                resp = converter_pb2.JobAck(
                     job_id="",
                     accepted=False,
                     message="video_id is required",
                     meta=dict_to_struct({"code": "BAD_REQUEST"}),
                 )
+                logger.info("rpc SubmitConvert -> accepted=%s msg=%s dt_ms=%d", resp.accepted, resp.message, int((time.time() - t0) * 1000))
+                return resp
 
             variants = []
             for v in request.variants:
@@ -74,38 +107,74 @@ def make_converter_servicer(converter_pb2_grpc, converter_pb2, cfg, logger, job_
                 msg = "accepted (idempotent reuse)"
 
             meta = {"next_offset": job.get_next_offset()}
-            return converter_pb2.JobAck(
+            resp = converter_pb2.JobAck(
                 job_id=job.job_id,
                 accepted=True,
                 message=msg,
                 meta=dict_to_struct(meta),
             )
 
+            logger.info(
+                "rpc SubmitConvert -> job_id=%s accepted=%s reused=%s next_offset=%s dt_ms=%d",
+                resp.job_id,
+                resp.accepted,
+                reused,
+                meta.get("next_offset"),
+                int((time.time() - t0) * 1000),
+            )
+            return resp
+
         def UploadSource(self, request_iterator, context):
+            t0 = time.time()
+            peer = _peer(context)
+            logger.info("rpc UploadSource peer=%s md=%s", peer, _md(context))
+
             first = True
             job = None
+            chunks = 0
+            bytes_in = 0
 
             for chunk in request_iterator:
+                chunks += 1
                 job_id = (chunk.job_id or "").strip()
                 if first:
+                    logger.info(
+                        "rpc UploadSource first_chunk job_id=%s offset=%d last=%s filename=%s content_type=%s total=%d",
+                        job_id,
+                        int(chunk.offset),
+                        bool(chunk.last),
+                        _short(chunk.filename),
+                        _short(chunk.content_type),
+                        int(chunk.total_size_bytes or 0),
+                    )
+
                     if not job_id:
-                        return converter_pb2.UploadAck(
+                        resp = converter_pb2.UploadAck(
                             job_id="",
                             accepted=False,
                             message="job_id is required",
                             received_bytes=0,
                             meta=dict_to_struct({"code": "BAD_REQUEST"}),
                         )
+                        logger.info("rpc UploadSource -> accepted=%s msg=%s dt_ms=%d", resp.accepted, resp.message, int((time.time() - t0) * 1000))
+                        return resp
+
                     job = job_store.get(job_id)
                     if not job:
-                        return converter_pb2.UploadAck(
+                        resp = converter_pb2.UploadAck(
                             job_id=job_id,
                             accepted=False,
                             message="job not found",
                             received_bytes=0,
                             meta=dict_to_struct({"code": "NOT_FOUND"}),
                         )
+                        logger.info("rpc UploadSource -> accepted=%s msg=%s dt_ms=%d", resp.accepted, resp.message, int((time.time() - t0) * 1000))
+                        return resp
+
                     first = False
+
+                data_len = len(chunk.data) if chunk.data else 0
+                bytes_in += data_len
 
                 ok, msg, received, next_off = job.append_upload_chunk(
                     offset=int(chunk.offset),
@@ -117,39 +186,66 @@ def make_converter_servicer(converter_pb2_grpc, converter_pb2, cfg, logger, job_
                 )
 
                 if not ok:
-                    return converter_pb2.UploadAck(
+                    resp = converter_pb2.UploadAck(
                         job_id=job.job_id,
                         accepted=False,
                         message=msg,
                         received_bytes=int(received),
                         meta=dict_to_struct({"next_offset": int(next_off)}),
                     )
+                    logger.warning(
+                        "rpc UploadSource -> accepted=%s msg=%s received=%d next_offset=%d chunks=%d bytes_in=%d dt_ms=%d",
+                        resp.accepted,
+                        resp.message,
+                        int(received),
+                        int(next_off),
+                        chunks,
+                        bytes_in,
+                        int((time.time() - t0) * 1000),
+                    )
+                    return resp
 
             if job is None:
-                return converter_pb2.UploadAck(
+                resp = converter_pb2.UploadAck(
                     job_id="",
                     accepted=False,
                     message="empty stream",
                     received_bytes=0,
                     meta=dict_to_struct({"code": "BAD_REQUEST"}),
                 )
+                logger.info("rpc UploadSource -> accepted=%s msg=%s dt_ms=%d", resp.accepted, resp.message, int((time.time() - t0) * 1000))
+                return resp
 
-            return converter_pb2.UploadAck(
+            resp = converter_pb2.UploadAck(
                 job_id=job.job_id,
                 accepted=True,
                 message="ok",
                 received_bytes=int(job.received_bytes),
                 meta=dict_to_struct({"next_offset": int(job.get_next_offset())}),
             )
+            logger.info(
+                "rpc UploadSource -> accepted=%s received=%d next_offset=%d chunks=%d bytes_in=%d dt_ms=%d",
+                resp.accepted,
+                resp.received_bytes,
+                int(job.get_next_offset()),
+                chunks,
+                bytes_in,
+                int((time.time() - t0) * 1000),
+            )
+            return resp
 
         def GetStatus(self, request, context):
+            t0 = time.time()
+            logger.info("rpc GetStatus peer=%s job_id=%s", _peer(context), _short(request.job_id))
+
             job_id = (request.job_id or "").strip()
             job = job_store.get(job_id)
             if not job:
+                logger.warning("rpc GetStatus -> NOT_FOUND job_id=%s dt_ms=%d", job_id, int((time.time() - t0) * 1000))
                 context.abort(grpc.StatusCode.NOT_FOUND, "job not found")
 
             err = _make_error(converter_pb2, job.error)
-            return converter_pb2.Status(
+            resp = converter_pb2.Status(
                 job_id=job.job_id,
                 video_id=job.video_id,
                 state=_state_to_pb(job.state, converter_pb2),
@@ -158,15 +254,27 @@ def make_converter_servicer(converter_pb2_grpc, converter_pb2, cfg, logger, job_
                 meta=dict_to_struct(job.meta or {}),
                 error=err,
             )
+            logger.info(
+                "rpc GetStatus -> state=%s percent=%d msg=%s dt_ms=%d",
+                resp.state,
+                resp.percent,
+                _short(resp.message),
+                int((time.time() - t0) * 1000),
+            )
+            return resp
 
         def GetPartialResult(self, request, context):
+            t0 = time.time()
+            logger.info("rpc GetPartialResult peer=%s job_id=%s", _peer(context), _short(request.job_id))
+
             job_id = (request.job_id or "").strip()
             job = job_store.get(job_id)
             if not job:
+                logger.warning("rpc GetPartialResult -> NOT_FOUND job_id=%s dt_ms=%d", job_id, int((time.time() - t0) * 1000))
                 context.abort(grpc.StatusCode.NOT_FOUND, "job not found")
 
             err = _make_error(converter_pb2, job.error)
-            return converter_pb2.PartialConvertResult(
+            resp = converter_pb2.PartialConvertResult(
                 job_id=job.job_id,
                 video_id=job.video_id,
                 state=_state_to_pb(job.state, converter_pb2),
@@ -177,16 +285,25 @@ def make_converter_servicer(converter_pb2_grpc, converter_pb2, cfg, logger, job_
                 meta=dict_to_struct(job.meta or {}),
                 error=err,
             )
+            logger.info(
+                "rpc GetPartialResult -> state=%s percent=%d ready=%d/%d dt_ms=%d",
+                resp.state,
+                resp.percent,
+                len(resp.ready_variant_ids),
+                resp.total_variants,
+                int((time.time() - t0) * 1000),
+            )
+            return resp
 
         def GetResult(self, request, context):
+            t0 = time.time()
+            logger.info("rpc GetResult peer=%s job_id=%s", _peer(context), _short(request.job_id))
+
             job_id = (request.job_id or "").strip()
             job = job_store.get(job_id)
             if not job:
+                logger.warning("rpc GetResult -> NOT_FOUND job_id=%s dt_ms=%d", job_id, int((time.time() - t0) * 1000))
                 context.abort(grpc.StatusCode.NOT_FOUND, "job not found")
-
-            if job.state not in (STATE_DONE, STATE_FAILED, STATE_CANCELED):
-                # allow calling early, but return current snapshot
-                pass
 
             results_map = {}
             for variant_id, vr in (job.results_by_variant_id or {}).items():
@@ -209,7 +326,7 @@ def make_converter_servicer(converter_pb2_grpc, converter_pb2, cfg, logger, job_
                 )
 
             err = _make_error(converter_pb2, job.error)
-            return converter_pb2.ConvertResult(
+            resp = converter_pb2.ConvertResult(
                 job_id=job.job_id,
                 video_id=job.video_id,
                 state=_state_to_pb(job.state, converter_pb2),
@@ -219,7 +336,25 @@ def make_converter_servicer(converter_pb2_grpc, converter_pb2, cfg, logger, job_
                 results_by_variant_id=results_map,
             )
 
+            logger.info(
+                "rpc GetResult -> state=%s variants=%d dt_ms=%d",
+                resp.state,
+                len(resp.results_by_variant_id),
+                int((time.time() - t0) * 1000),
+            )
+            return resp
+
         def DownloadResult(self, request, context):
+            t0 = time.time()
+            logger.info(
+                "rpc DownloadResult peer=%s job_id=%s variant_id=%s artifact_id=%s offset=%d",
+                _peer(context),
+                _short(request.job_id),
+                _short(request.variant_id),
+                _short(request.artifact_id),
+                int(request.offset or 0),
+            )
+
             job_id = (request.job_id or "").strip()
             variant_id = (request.variant_id or "").strip()
             artifact_id = (request.artifact_id or "").strip()
@@ -249,8 +384,16 @@ def make_converter_servicer(converter_pb2_grpc, converter_pb2, cfg, logger, job_
             if offset < 0 or offset > total:
                 context.abort(grpc.StatusCode.OUT_OF_RANGE, "bad offset")
 
+            logger.info(
+                "rpc DownloadResult serving filename=%s size=%d mime=%s",
+                artifact.get("filename", ""),
+                total,
+                artifact.get("mime", ""),
+            )
+
             chunk_size = int(cfg.get("download_chunk_bytes") or (1024 * 1024))
 
+            sent = 0
             with open(path, "rb") as f:
                 f.seek(offset)
                 cur = offset
@@ -267,10 +410,11 @@ def make_converter_servicer(converter_pb2_grpc, converter_pb2, cfg, logger, job_
                             total_size_bytes=total if first else 0,
                             sha256_total=bytes.fromhex(artifact.get("sha256", "")) if (first and artifact.get("sha256")) else b"",
                         )
-                        return
+                        break
 
                     next_off = cur + len(b)
                     last = next_off >= total
+                    sent += len(b)
 
                     yield converter_pb2.DownloadChunk(
                         offset=int(cur),
@@ -285,9 +429,12 @@ def make_converter_servicer(converter_pb2_grpc, converter_pb2, cfg, logger, job_
                     first = False
                     cur = next_off
                     if last:
-                        return
+                        break
+
+            logger.info("rpc DownloadResult done sent=%d dt_ms=%d", sent, int((time.time() - t0) * 1000))
 
         def WatchJob(self, request, context):
+            logger.info("rpc WatchJob peer=%s job_id=%s send_initial=%s", _peer(context), _short(request.job_id), bool(request.send_initial))
             job_id = (request.job_id or "").strip()
             job = job_store.get(job_id)
             if not job:
@@ -336,9 +483,11 @@ def make_converter_servicer(converter_pb2_grpc, converter_pb2, cfg, logger, job_
                     yield converter_pb2.JobEvent(type=converter_pb2.JobEvent.PARTIAL, partial=partial)
 
                     if job.state == STATE_DONE:
+                        logger.info("rpc WatchJob job_id=%s DONE", job_id)
                         yield converter_pb2.JobEvent(type=converter_pb2.JobEvent.DONE, partial=partial)
                         return
                     if job.state == STATE_FAILED:
+                        logger.info("rpc WatchJob job_id=%s FAILED", job_id)
                         yield converter_pb2.JobEvent(type=converter_pb2.JobEvent.FAILED, partial=partial)
                         return
 

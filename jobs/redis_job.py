@@ -1,8 +1,8 @@
 import json
 import os
 import threading
-import time
 import uuid
+import traceback
 
 import redis
 
@@ -43,26 +43,7 @@ def _i(s, default=0):
         return default
 
 
-def _f(s, default=0.0):
-    try:
-        return float(_u(s, default))
-    except Exception:
-        return default
-
-
 def parse_variant_id(variant_id):
-    """
-    Fallback parser for ids like:
-      v:1440p:h264+aac:mp4
-      a:128k:aac:m4a
-    Returns dict with possible keys:
-      kind: "video"|"audio"
-      height: int
-      audio_bitrate_kbps: int
-      container: str
-      vcodec: str
-      acodec: str
-    """
     s = (variant_id or "").strip()
     if not s:
         return {}
@@ -78,7 +59,6 @@ def parse_variant_id(variant_id):
     elif head == "a":
         out["kind"] = "audio"
 
-    # second part: 1440p / 128k etc
     p1 = parts[1].strip().lower()
     if p1.endswith("p"):
         try:
@@ -91,7 +71,6 @@ def parse_variant_id(variant_id):
         except Exception:
             pass
 
-    # codec segment could be like "h264+aac" or "aac"
     if len(parts) >= 3:
         c = parts[2].strip().lower()
         if "+" in c:
@@ -99,13 +78,11 @@ def parse_variant_id(variant_id):
             out["vcodec"] = v.strip()
             out["acodec"] = a.strip()
         else:
-            # audio-only form often: a:128k:aac:m4a
             if out.get("kind") == "audio":
                 out["acodec"] = c
             else:
                 out["vcodec"] = c
 
-    # container in last part
     if len(parts) >= 4:
         out["container"] = parts[3].strip().lower()
 
@@ -119,10 +96,6 @@ class RedisJobStore:
         self.prefix = cfg.get("redis_prefix") or "ytconvert:"
         self.redis = redis.Redis.from_url(cfg.get("redis_url"), decode_responses=False)
         self._lock = threading.RLock()
-
-        self._metric_uploaded_bytes = 0
-
-    # ---- key helpers
 
     def _k(self, suffix):
         return f"{self.prefix}{suffix}"
@@ -139,10 +112,7 @@ class RedisJobStore:
     def _job_ids_set_key(self):
         return self._k("jobs")
 
-    # ---- metrics for Info
-
     def metrics_snapshot(self):
-        # best-effort; Redis may be down
         try:
             total = self.redis.scard(self._job_ids_set_key())
             queued = self.redis.scard(self._state_set_key(STATE_QUEUED))
@@ -166,8 +136,6 @@ class RedisJobStore:
             "jobs_canceled": float(canceled),
         }
 
-    # ---- JobStore interface
-
     def create_job(self, video_id, variants, options, idempotency_key=""):
         with self._lock:
             if idempotency_key:
@@ -175,10 +143,12 @@ class RedisJobStore:
                     existing = self.redis.get(self._idem_key(idempotency_key))
                 except Exception:
                     existing = None
+
                 if existing:
                     jid = _u(existing, "")
                     job = self.get(jid)
                     if job:
+                        self.logger.info("redis: idempotency hit key=%s -> job_id=%s", idempotency_key, jid)
                         return job, True
 
             job_id = new_job_id()
@@ -213,6 +183,7 @@ class RedisJobStore:
                 pipe.set(self._idem_key(idempotency_key), job_id)
             pipe.execute()
 
+            self.logger.info("redis: created job_id=%s video_id=%s variants=%d", job_id, video_id, len(variants or []))
             return job, False
 
     def get(self, job_id):
@@ -267,17 +238,22 @@ class RedisJobStore:
                 continue
 
             try:
-                # remove redis keys
                 pipe = self.redis.pipeline()
                 pipe.delete(k)
                 pipe.srem(self._job_ids_set_key(), jid)
-                for st in (STATE_QUEUED, STATE_WAITING_UPLOAD, STATE_RUNNING, STATE_DONE, STATE_FAILED, STATE_CANCELED):
+                for st in (
+                    STATE_QUEUED,
+                    STATE_WAITING_UPLOAD,
+                    STATE_RUNNING,
+                    STATE_DONE,
+                    STATE_FAILED,
+                    STATE_CANCELED,
+                ):
                     pipe.srem(self._state_set_key(st), jid)
                 pipe.execute()
             except Exception:
                 continue
 
-            # remove job workdir
             workdir = os.path.join(self.cfg["workdir"], jid)
             rm_tree(workdir)
 
@@ -302,8 +278,6 @@ class RedisConvertJob:
 
         ensure_dir(self.workdir)
         ensure_dir(self.results_dir)
-
-    # ---- computed snapshot properties (match old in-memory usage)
 
     @property
     def video_id(self):
@@ -352,8 +326,6 @@ class RedisConvertJob:
     def is_terminal(self):
         return self.state in (STATE_DONE, STATE_FAILED, STATE_CANCELED)
 
-    # ---- redis helpers
-
     def _key(self):
         return self.store._job_key(self.job_id)
 
@@ -382,8 +354,6 @@ class RedisConvertJob:
     def _hset_json(self, field, obj):
         self._hset({field: _j(obj)})
 
-    # ---- state transitions
-
     def _set_state(self, state, percent=None, message=None, meta=None):
         old_state = self.state
         mapping = {"state": str(int(state))}
@@ -407,15 +377,14 @@ class RedisConvertJob:
         pipe.execute()
 
     def _fail(self, code, message, meta=None):
-        self.logger.error("job %s failed: %s (%s)", self.job_id, message, code)
+        self.logger.error("job %s: FAILED code=%s message=%s", self.job_id, code, message)
         err = {"code": code, "message": message, "meta": meta or {}}
         self._hset_json("error_json", err)
         self._set_state(STATE_FAILED, percent=max(self.percent, 0), message=message, meta=self.meta)
 
     def _done(self):
         self._set_state(STATE_DONE, percent=100, message="done", meta=self.meta)
-
-    # ---- upload
+        self.logger.info("job %s: DONE", self.job_id)
 
     def append_upload_chunk(self, offset, data, last, filename="", content_type="", total_size_bytes=0):
         if self.is_terminal():
@@ -423,6 +392,7 @@ class RedisConvertJob:
 
         expected = self.get_next_offset()
         if int(offset) != int(expected):
+            self.logger.warning("job %s: upload bad offset got=%d expected=%d", self.job_id, int(offset), int(expected))
             return False, "bad offset", self.received_bytes, expected
 
         if data:
@@ -437,10 +407,7 @@ class RedisConvertJob:
             new_received = self.received_bytes + len(data)
             new_expected = expected + len(data)
 
-            self._hset({
-                "received_bytes": str(int(new_received)),
-                "expected_offset": str(int(new_expected)),
-            })
+            self._hset({"received_bytes": str(int(new_received)), "expected_offset": str(int(new_expected))})
 
             if not os.path.exists(self.src_meta_path):
                 meta = {
@@ -456,15 +423,13 @@ class RedisConvertJob:
 
         if last:
             self._hset({"upload_done": "1"})
+            self.logger.info("job %s: upload finished received=%d", self.job_id, int(self.received_bytes))
             if self.state == STATE_WAITING_UPLOAD:
                 self._start_worker_async()
 
         return True, "ok", self.received_bytes, self.get_next_offset()
 
-    # ---- conversion worker (best-effort single runner)
-
     def _start_worker_async(self):
-        # Use SETNX-like lock in Redis to avoid parallel workers.
         lock_key = self.store._k(f"lock:jobrun:{self.job_id}")
         try:
             ok = self.store.redis.set(lock_key, "1", nx=True, ex=3600)
@@ -472,86 +437,106 @@ class RedisConvertJob:
             ok = None
 
         if not ok:
+            self.logger.info("job %s: worker already running (lock exists)", self.job_id)
             return
 
+        self.logger.info("job %s: worker starting", self.job_id)
         t = threading.Thread(target=self._run_convert, name=f"job-{self.job_id}", daemon=True)
         t.start()
 
     def _run_convert(self):
-        self._set_state(STATE_RUNNING, percent=0, message="running", meta={"stage": "PROBE"})
+        try:
+            src_size = os.path.getsize(self.src_path) if os.path.exists(self.src_path) else 0
+            self.logger.info("job %s: RUNNING source=%s size=%d", self.job_id, self.src_path, src_size)
 
-        if not os.path.exists(self.src_path) or os.path.getsize(self.src_path) == 0:
-            self._fail("NO_SOURCE", "No uploaded source", {})
-            return
+            self._set_state(STATE_RUNNING, percent=0, message="running", meta={"stage": "PROBE"})
 
-        ok = self._probe_source()
-        if not ok:
-            return
-
-        variants = self.variants or []
-        total = len(variants)
-
-        for idx, v in enumerate(variants):
-            variant_id = (v.get("variant_id") or "").strip()
-            if not variant_id:
-                self._fail("BAD_REQUEST", "Variant without variant_id", {})
+            if not os.path.exists(self.src_path) or os.path.getsize(self.src_path) == 0:
+                self._fail("NO_SOURCE", "No uploaded source", {})
                 return
 
-            # fallback parse
-            parsed = parse_variant_id(variant_id)
-            kind = int(v.get("kind") or 0)
-            container = (v.get("container") or "").strip().lower()
-            height = int(v.get("height") or 0)
-            abr = int(v.get("audio_bitrate_kbps") or 0)
-            vcodec = (v.get("vcodec") or "").strip().lower()
-            acodec = (v.get("acodec") or "").strip().lower()
+            ok = self._probe_source()
+            if not ok:
+                return
 
-            if not container:
-                container = parsed.get("container", "")
-            if not vcodec:
-                vcodec = parsed.get("vcodec", "")
-            if not acodec:
-                acodec = parsed.get("acodec", "")
-            if height <= 0:
-                height = int(parsed.get("height") or 0)
-            if abr <= 0:
-                abr = int(parsed.get("audio_bitrate_kbps") or 0)
+            variants = self.variants or []
+            total = len(variants)
 
-            # If kind unspecified, infer from parsed
-            if kind == 0:
-                if parsed.get("kind") == "audio":
-                    kind = 2
-                elif parsed.get("kind") == "video":
-                    kind = 1
+            for idx, v in enumerate(variants):
+                variant_id = (v.get("variant_id") or "").strip()
+                if not variant_id:
+                    self._fail("BAD_REQUEST", "Variant without variant_id", {})
+                    return
 
-            v2 = dict(v)
-            v2["container"] = container or v.get("container")
-            v2["vcodec"] = vcodec or v.get("vcodec")
-            v2["acodec"] = acodec or v.get("acodec")
-            v2["height"] = height
-            v2["audio_bitrate_kbps"] = abr
-            v2["kind"] = kind
+                parsed = parse_variant_id(variant_id)
 
-            stage_meta = {"stage": "ENCODE", "variant": variant_id}
-            self._set_state(
-                STATE_RUNNING,
-                percent=int((idx * 100) / max(total, 1)),
-                message="encoding",
-                meta=stage_meta,
-            )
+                kind = int(v.get("kind") or 0)
+                container = (v.get("container") or "").strip().lower()
+                height = int(v.get("height") or 0)
+                abr = int(v.get("audio_bitrate_kbps") or 0)
+                vcodec = (v.get("vcodec") or "").strip().lower()
+                acodec = (v.get("acodec") or "").strip().lower()
 
-            try:
+                if not container:
+                    container = parsed.get("container", "")
+                if not vcodec:
+                    vcodec = parsed.get("vcodec", "")
+                if not acodec:
+                    acodec = parsed.get("acodec", "")
+                if height <= 0:
+                    height = int(parsed.get("height") or 0)
+                if abr <= 0:
+                    abr = int(parsed.get("audio_bitrate_kbps") or 0)
+
+                if kind == 0:
+                    if parsed.get("kind") == "audio":
+                        kind = 2
+                    elif parsed.get("kind") == "video":
+                        kind = 1
+
+                v2 = dict(v)
+                v2["container"] = container or v.get("container")
+                v2["vcodec"] = vcodec or v.get("vcodec")
+                v2["acodec"] = acodec or v.get("acodec")
+                v2["height"] = height
+                v2["audio_bitrate_kbps"] = abr
+                v2["kind"] = kind
+
+                stage_meta = {"stage": "ENCODE", "variant": variant_id}
+                self._set_state(
+                    STATE_RUNNING,
+                    percent=int((idx * 100) / max(total, 1)),
+                    message="encoding",
+                    meta=stage_meta,
+                )
+
+                self.logger.info(
+                    "job %s: ENCODE start variant_id=%s kind=%d height=%d abr=%d container=%s vcodec=%s acodec=%s",
+                    self.job_id,
+                    variant_id,
+                    int(kind),
+                    int(height),
+                    int(abr),
+                    container,
+                    vcodec,
+                    acodec,
+                )
+
                 if kind == 2 or (container in ("m4a", "mp3") and kind != 1):
                     self._encode_audio_variant(v2, variant_id)
                 else:
                     self._encode_video_variant(v2, variant_id)
 
                 self._mark_variant_ready(variant_id)
-            except Exception as e:
-                self._fail("FFMPEG_FAILED", "ffmpeg failed", {"exception": str(e), "variant_id": variant_id})
-                return
 
-        self._done()
+                arts_n = len((self.results_by_variant_id.get(variant_id) or {}).get("artifacts", []))
+                self.logger.info("job %s: ENCODE done variant_id=%s artifacts=%d", self.job_id, variant_id, arts_n)
+
+            self._done()
+
+        except Exception as e:
+            tb = traceback.format_exc()[-4000:]
+            self._fail("INTERNAL", "Unhandled exception in worker", {"exception": str(e), "traceback": tb})
 
     def _mark_variant_ready(self, variant_id):
         ready = sorted(list(self.ready_variant_ids.union({variant_id})))
@@ -579,6 +564,7 @@ class RedisConvertJob:
             info = {}
 
         self._set_state(self.state, meta={"stage": "PROBE", "ffprobe": info})
+        self.logger.info("job %s: PROBE ok", self.job_id)
         return True
 
     def _encode_video_variant(self, v, variant_id):
@@ -628,11 +614,18 @@ class RedisConvertJob:
 
         ffmpeg = self.cfg["ffmpeg_bin"]
         args = [
-            ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-            "-i", self.src_path,
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            self.src_path,
             "-vn",
-            "-c:a", "aac",
-            "-b:a", f"{bitrate}k",
+            "-c:a",
+            "aac",
+            "-b:a",
+            f"{bitrate}k",
             out_path,
         ]
 
