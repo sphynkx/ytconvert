@@ -8,13 +8,15 @@ from utils.time_ut import now_ts
 from utils.proc_ut import run_cmd_capture
 from utils.hash_ut import sha256_file
 
-
-STATE_QUEUED = 1
-STATE_WAITING_UPLOAD = 2
-STATE_RUNNING = 3
-STATE_DONE = 4
-STATE_FAILED = 5
-STATE_CANCELED = 6
+from jobs.redis_job import (
+    STATE_QUEUED,
+    STATE_WAITING_UPLOAD,
+    STATE_RUNNING,
+    STATE_DONE,
+    STATE_FAILED,
+    STATE_CANCELED,
+    RedisJobStore as JobStore,
+)
 
 
 def new_job_id():

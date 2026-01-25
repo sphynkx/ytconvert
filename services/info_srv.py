@@ -3,7 +3,6 @@ import time
 
 from utils.grpc_ut import dict_to_struct  # not used but kept for future
 
-## TODO: Rework to get predefined host from .env
 
 def build_info_response(pb2, cfg, started_monotonic, metrics_provider=None):
     host = cfg.get("advertise_host") or cfg.get("host") or socket.gethostname()

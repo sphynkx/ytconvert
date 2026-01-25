@@ -25,7 +25,6 @@ def _configure_logging():
 
 
 def main():
-    # Loads .env into process env (does not override already-set env vars by default)
     load_dotenv(".env")
 
     logger = _configure_logging()

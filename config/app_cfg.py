@@ -3,7 +3,10 @@ import os
 
 def _env(name, default=None):
     v = os.getenv(name)
-    if v is None or v == "":
+    if v is None:
+        return default
+    v = str(v).strip()
+    if v == "":
         return default
     return v
 
@@ -31,6 +34,11 @@ def load_app_cfg():
 
     cfg["redis_url"] = _env("YTCONVERT_REDIS_URL", "")
     cfg["redis_prefix"] = _env("YTCONVERT_REDIS_PREFIX", "ytconvert:")
+
+    p = cfg["redis_prefix"] or "ytconvert:"
+    if not p.endswith(":"):
+        p = p + ":"
+    cfg["redis_prefix"] = p
 
     cfg["workdir"] = _env("YTCONVERT_WORKDIR", "/tmp/ytconvert/jobs")
     cfg["ttl_seconds"] = _env_int("YTCONVERT_TTL_SECONDS", 24 * 3600)
