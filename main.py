@@ -45,8 +45,20 @@ def main():
     )
     cleanup_thread.start()
 
+    def metrics_provider():
+        try:
+            return job_store.metrics_snapshot()
+        except Exception:
+            return {}
+
     def add_services(server):
-        info_serv = make_info_servicer(info_pb2_grpc, info_pb2, cfg, started_monotonic)
+        info_serv = make_info_servicer(
+            info_pb2_grpc,
+            info_pb2,
+            cfg,
+            started_monotonic,
+            metrics_provider=metrics_provider,
+        )
         info_pb2_grpc.add_InfoServicer_to_server(info_serv, server)
 
         conv_serv = make_converter_servicer(ytconvert_pb2_grpc, ytconvert_pb2, cfg, logger, job_store)
