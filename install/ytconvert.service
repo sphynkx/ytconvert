@@ -1,0 +1,19 @@
+[Unit]
+Description=ytConvert Service
+After=network.target
+
+[Service]
+User=root
+Group=root
+
+WorkingDirectory=/opt/ytconvert
+
+ExecStart=/opt/ytconvert/.venv/bin/python /opt/ytconvert/main.py
+
+Environment=PYTHONUNBUFFERED=1
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
