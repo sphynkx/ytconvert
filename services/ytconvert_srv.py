@@ -5,7 +5,7 @@ import grpc
 
 from google.protobuf import struct_pb2
 
-from jobs.convert_job import (
+from jobs.redis_job import (
     STATE_QUEUED,
     STATE_WAITING_UPLOAD,
     STATE_RUNNING,
@@ -203,6 +203,7 @@ def make_converter_servicer(converter_pb2_grpc, converter_pb2, cfg, logger, job_
                         bytes_in,
                         int((time.time() - t0) * 1000),
                     )
+                    logger.info("rpc UploadSource stream_end job_id=%s chunks=%d bytes_in=%d", job.job_id if job else "", chunks, bytes_in)
                     return resp
 
             if job is None:
@@ -434,7 +435,13 @@ def make_converter_servicer(converter_pb2_grpc, converter_pb2, cfg, logger, job_
             logger.info("rpc DownloadResult done sent=%d dt_ms=%d", sent, int((time.time() - t0) * 1000))
 
         def WatchJob(self, request, context):
-            logger.info("rpc WatchJob peer=%s job_id=%s send_initial=%s", _peer(context), _short(request.job_id), bool(request.send_initial))
+            logger.info(
+                "rpc WatchJob peer=%s job_id=%s send_initial=%s",
+                _peer(context),
+                _short(request.job_id),
+                bool(request.send_initial),
+            )
+
             job_id = (request.job_id or "").strip()
             job = job_store.get(job_id)
             if not job:
@@ -445,10 +452,12 @@ def make_converter_servicer(converter_pb2_grpc, converter_pb2, cfg, logger, job_
 
             last_state = None
             last_percent = None
+            last_message = None
+            last_meta_json = None
             last_ready = None
 
-            if send_initial:
-                st = converter_pb2.Status(
+            def make_status():
+                return converter_pb2.Status(
                     job_id=job.job_id,
                     video_id=job.video_id,
                     state=_state_to_pb(job.state, converter_pb2),
@@ -457,7 +466,28 @@ def make_converter_servicer(converter_pb2_grpc, converter_pb2, cfg, logger, job_
                     meta=dict_to_struct(job.meta or {}),
                     error=_make_error(converter_pb2, job.error),
                 )
+
+            def make_partial(ready):
+                return converter_pb2.PartialConvertResult(
+                    job_id=job.job_id,
+                    video_id=job.video_id,
+                    state=_state_to_pb(job.state, converter_pb2),
+                    percent=int(job.percent),
+                    message=job.message or "",
+                    ready_variant_ids=list(ready),
+                    total_variants=len(job.variants),
+                    meta=dict_to_struct(job.meta or {}),
+                    error=_make_error(converter_pb2, job.error),
+                )
+
+            if send_initial:
+                st = make_status()
                 yield converter_pb2.JobEvent(type=converter_pb2.JobEvent.STATUS, status=st)
+                last_state = job.state
+                last_percent = job.percent
+                last_message = job.message
+                last_meta_json = str(job.meta or {})
+                last_ready = tuple(sorted(list(job.ready_variant_ids)))
 
             while True:
                 if context.is_active() is False:
@@ -465,36 +495,44 @@ def make_converter_servicer(converter_pb2_grpc, converter_pb2, cfg, logger, job_
 
                 state = job.state
                 percent = job.percent
+                message = job.message
+                meta_json = str(job.meta or {})
                 ready = tuple(sorted(list(job.ready_variant_ids)))
 
-                changed = (state != last_state) or (percent != last_percent) or (ready != last_ready)
-                if changed:
-                    partial = converter_pb2.PartialConvertResult(
-                        job_id=job.job_id,
-                        video_id=job.video_id,
-                        state=_state_to_pb(job.state, converter_pb2),
-                        percent=int(job.percent),
-                        message=job.message or "",
-                        ready_variant_ids=list(ready),
-                        total_variants=len(job.variants),
-                        meta=dict_to_struct(job.meta or {}),
-                        error=_make_error(converter_pb2, job.error),
-                    )
-                    yield converter_pb2.JobEvent(type=converter_pb2.JobEvent.PARTIAL, partial=partial)
+                status_changed = (
+                    state != last_state
+                    or percent != last_percent
+                    or message != last_message
+                    or meta_json != last_meta_json
+                )
 
-                    if job.state == STATE_DONE:
-                        logger.info("rpc WatchJob job_id=%s DONE", job_id)
-                        yield converter_pb2.JobEvent(type=converter_pb2.JobEvent.DONE, partial=partial)
-                        return
-                    if job.state == STATE_FAILED:
-                        logger.info("rpc WatchJob job_id=%s FAILED", job_id)
-                        yield converter_pb2.JobEvent(type=converter_pb2.JobEvent.FAILED, partial=partial)
-                        return
+                ready_changed = (ready != last_ready)
+
+                if status_changed:
+                    st = make_status()
+                    yield converter_pb2.JobEvent(type=converter_pb2.JobEvent.STATUS, status=st)
 
                     last_state = state
                     last_percent = percent
+                    last_message = message
+                    last_meta_json = meta_json
+
+                if ready_changed or state in (STATE_DONE, STATE_FAILED, STATE_CANCELED):
+                    partial = make_partial(ready)
+                    yield converter_pb2.JobEvent(type=converter_pb2.JobEvent.PARTIAL, partial=partial)
                     last_ready = ready
-                else:
+
+                if state == STATE_DONE:
+                    logger.info("rpc WatchJob job_id=%s DONE", job_id)
+                    yield converter_pb2.JobEvent(type=converter_pb2.JobEvent.DONE, partial=make_partial(ready))
+                    return
+
+                if state == STATE_FAILED:
+                    logger.info("rpc WatchJob job_id=%s FAILED", job_id)
+                    yield converter_pb2.JobEvent(type=converter_pb2.JobEvent.FAILED, partial=make_partial(ready))
+                    return
+
+                if (not status_changed) and (not ready_changed):
                     yield converter_pb2.JobEvent(type=converter_pb2.JobEvent.HEARTBEAT)
 
                 time.sleep(heartbeat)

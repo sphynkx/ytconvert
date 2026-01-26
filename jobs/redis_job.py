@@ -3,6 +3,8 @@ import os
 import threading
 import uuid
 import traceback
+import subprocess
+import time
 
 import redis
 
@@ -41,6 +43,25 @@ def _i(s, default=0):
         return int(_u(s, default))
     except Exception:
         return default
+
+
+def _f(s, default=0.0):
+    try:
+        return float(_u(s, default))
+    except Exception:
+        return default
+
+
+def clamp_int(v, lo, hi):
+    try:
+        v = int(v)
+    except Exception:
+        v = lo
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
 
 
 def parse_variant_id(variant_id):
@@ -173,6 +194,7 @@ class RedisJobStore:
                 "options_json": _j(options or {}),
                 "ready_variant_ids_json": _j([]),
                 "results_by_variant_id_json": _j({}),
+                "duration_sec": "0",
             }
 
             pipe = self.redis.pipeline()
@@ -256,7 +278,6 @@ class RedisJobStore:
 
             workdir = os.path.join(self.cfg["workdir"], jid)
             rm_tree(workdir)
-
             removed += 1
 
         if removed:
@@ -278,6 +299,9 @@ class RedisConvertJob:
 
         ensure_dir(self.workdir)
         ensure_dir(self.results_dir)
+
+        self._last_progress_ts = 0.0
+        self._last_job_percent = -1
 
     @property
     def video_id(self):
@@ -406,7 +430,6 @@ class RedisConvertJob:
 
             new_received = self.received_bytes + len(data)
             new_expected = expected + len(data)
-
             self._hset({"received_bytes": str(int(new_received)), "expected_offset": str(int(new_expected))})
 
             if not os.path.exists(self.src_meta_path):
@@ -446,21 +469,28 @@ class RedisConvertJob:
 
     def _run_convert(self):
         try:
-            src_size = os.path.getsize(self.src_path) if os.path.exists(self.src_path) else 0
-            self.logger.info("job %s: RUNNING source=%s size=%d", self.job_id, self.src_path, src_size)
-
             self._set_state(STATE_RUNNING, percent=0, message="running", meta={"stage": "PROBE"})
 
             if not os.path.exists(self.src_path) or os.path.getsize(self.src_path) == 0:
                 self._fail("NO_SOURCE", "No uploaded source", {})
                 return
 
-            ok = self._probe_source()
-            if not ok:
-                return
+            duration_sec = self._probe_duration_sec()
+            self._hset({"duration_sec": str(duration_sec)})
 
             variants = self.variants or []
             total = len(variants)
+
+            task_weights = []
+            task_progress = []
+            for v in variants:
+                kind = int(v.get("kind") or 0)
+                # weight rule: video=1.0, audio=0.3
+                w = 1.0
+                if kind == 2:
+                    w = 0.3
+                task_weights.append(w)
+                task_progress.append(0)
 
             for idx, v in enumerate(variants):
                 variant_id = (v.get("variant_id") or "").strip()
@@ -505,32 +535,43 @@ class RedisConvertJob:
                 stage_meta = {"stage": "ENCODE", "variant": variant_id}
                 self._set_state(
                     STATE_RUNNING,
-                    percent=int((idx * 100) / max(total, 1)),
+                    percent=self._calc_job_percent(task_progress, task_weights),
                     message="encoding",
                     meta=stage_meta,
                 )
 
                 self.logger.info(
-                    "job %s: ENCODE start variant_id=%s kind=%d height=%d abr=%d container=%s vcodec=%s acodec=%s",
+                    "job %s: ENCODE start variant_id=%s kind=%d height=%d abr=%d container=%s",
                     self.job_id,
                     variant_id,
                     int(kind),
                     int(height),
                     int(abr),
                     container,
-                    vcodec,
-                    acodec,
                 )
 
+                def on_variant_progress(vpct, extra_meta):
+                    task_progress[idx] = vpct
+                    jobpct = self._calc_job_percent(task_progress, task_weights)
+
+                    meta2 = {"stage": "ENCODE", "variant": variant_id}
+                    meta2.update(extra_meta or {})
+                    meta2["variant_percent"] = int(vpct)
+                    meta2["duration_sec"] = float(duration_sec)
+
+                    self._publish_progress(jobpct, meta2)
+
                 if kind == 2 or (container in ("m4a", "mp3") and kind != 1):
-                    self._encode_audio_variant(v2, variant_id)
+                    # audio: treat progress as 0->100 but push updates based on time if possible
+                    self._encode_audio_variant(v2, variant_id, duration_sec, on_variant_progress)
                 else:
-                    self._encode_video_variant(v2, variant_id)
+                    self._encode_video_variant(v2, variant_id, duration_sec, on_variant_progress)
 
+                task_progress[idx] = 100
                 self._mark_variant_ready(variant_id)
+                self._publish_progress(self._calc_job_percent(task_progress, task_weights), {"stage": "ENCODE", "variant": variant_id})
 
-                arts_n = len((self.results_by_variant_id.get(variant_id) or {}).get("artifacts", []))
-                self.logger.info("job %s: ENCODE done variant_id=%s artifacts=%d", self.job_id, variant_id, arts_n)
+                self.logger.info("job %s: ENCODE done variant_id=%s", self.job_id, variant_id)
 
             self._done()
 
@@ -538,12 +579,39 @@ class RedisConvertJob:
             tb = traceback.format_exc()[-4000:]
             self._fail("INTERNAL", "Unhandled exception in worker", {"exception": str(e), "traceback": tb})
 
+    def _publish_progress(self, job_percent, meta):
+        now_mono = time.monotonic()
+        job_percent = clamp_int(job_percent, 0, 99) if self.state == STATE_RUNNING else clamp_int(job_percent, 0, 100)
+
+        # throttle: at most once per 0.8s OR if percent changed by >=1
+        if (now_mono - self._last_progress_ts) < 0.8 and job_percent == self._last_job_percent:
+            return
+
+        self._last_progress_ts = now_mono
+        self._last_job_percent = job_percent
+
+        self._set_state(self.state, percent=job_percent, message="encoding", meta=meta or {})
+
+    def _calc_job_percent(self, progresses, weights):
+        if not progresses:
+            return 0
+        if not weights or len(weights) != len(progresses):
+            return clamp_int(sum(progresses) / max(len(progresses), 1), 0, 100)
+
+        sw = float(sum(weights)) if weights else 1.0
+        if sw <= 0:
+            sw = 1.0
+        acc = 0.0
+        for p, w in zip(progresses, weights):
+            acc += float(p) * float(w)
+        return clamp_int(acc / sw, 0, 100)
+
     def _mark_variant_ready(self, variant_id):
         ready = sorted(list(self.ready_variant_ids.union({variant_id})))
         self._hset_json("ready_variant_ids_json", ready)
         self._persist_results_index()
 
-    def _probe_source(self):
+    def _probe_duration_sec(self):
         ffprobe = self.cfg["ffprobe_bin"]
         args = [
             ffprobe,
@@ -556,18 +624,95 @@ class RedisConvertJob:
         code, out, err = run_cmd_capture(args, cwd=self.workdir)
         if code != 0:
             self._fail("FFPROBE_FAILED", "ffprobe failed", {"exit_code": code, "stderr": (err or "")[-4000:]})
-            return False
+            raise RuntimeError("ffprobe failed")
 
         try:
             info = json.loads(out) if out else {}
         except Exception:
             info = {}
 
-        self._set_state(self.state, meta={"stage": "PROBE", "ffprobe": info})
-        self.logger.info("job %s: PROBE ok", self.job_id)
-        return True
+        duration_sec = 0.0
+        fmt = info.get("format") or {}
+        duration_str = fmt.get("duration")
+        duration_sec = _f(duration_str, 0.0)
 
-    def _encode_video_variant(self, v, variant_id):
+        if duration_sec <= 0:
+            streams = info.get("streams") or []
+            for s in streams:
+                d = _f(s.get("duration"), 0.0)
+                if d > duration_sec:
+                    duration_sec = d
+
+        duration_sec = float(duration_sec or 0.0)
+        if duration_sec <= 0:
+            duration_sec = 1.0
+
+        meta = {"stage": "PROBE", "ffprobe": info}
+        self._set_state(self.state, percent=self.percent, message=self.message, meta=meta)
+        self.logger.info("job %s: PROBE ok duration_sec=%.3f", self.job_id, duration_sec)
+        return duration_sec
+
+    def _run_ffmpeg_with_progress(self, args, duration_sec, on_progress):
+        p = subprocess.Popen(
+            args,
+            cwd=self.workdir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+        )
+
+        out_time_ms = 0
+        speed = ""
+        last_vpct = -1
+
+        def emit(vpct):
+            nonlocal last_vpct
+            vpct = clamp_int(vpct, 0, 100)
+            if vpct == last_vpct:
+                return
+            last_vpct = vpct
+            if on_progress:
+                on_progress(vpct, {"current_out_time_sec": float(out_time_ms) / 1_000_000.0, "speed": speed})
+
+        try:
+            for line in p.stdout:
+                line = (line or "").strip()
+                if not line or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+
+                if k == "out_time_ms":
+                    try:
+                        out_time_ms = int(v)
+                    except Exception:
+                        out_time_ms = 0
+                    out_sec = float(out_time_ms) / 1_000_000.0
+                    vpct = int((out_sec / float(duration_sec)) * 100.0)
+                    vpct = clamp_int(vpct, 0, 99)
+                    emit(vpct)
+
+                elif k == "speed":
+                    speed = v
+
+                elif k == "progress" and v == "end":
+                    emit(100)
+
+        finally:
+            rc = p.wait()
+            stderr = ""
+            try:
+                if p.stderr:
+                    stderr = p.stderr.read() or ""
+            except Exception:
+                stderr = ""
+            if rc != 0:
+                raise RuntimeError(stderr[-4000:])
+
+    def _encode_video_variant(self, v, variant_id, duration_sec, on_variant_progress):
         label = v.get("label") or ""
         height = int(v.get("height") or 0)
         vcodec = (v.get("vcodec") or "h264").lower() or "h264"
@@ -587,22 +732,22 @@ class RedisConvertJob:
         vf = f"scale=-2:{height}" if height > 0 else None
 
         ffmpeg = self.cfg["ffmpeg_bin"]
-        args = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", self.src_path]
+        args = [ffmpeg, "-y", "-hide_banner", "-nostats", "-loglevel", "error", "-i", self.src_path]
+
         if vf:
             args += ["-vf", vf]
 
         args += ["-c:v", "libx264"] if vcodec == "h264" else ["-c:v", "copy"] if vcodec == "copy" else ["-c:v", "libx264"]
         args += ["-c:a", "aac"] if acodec == "aac" else ["-c:a", "copy"] if acodec == "copy" else ["-c:a", "aac"]
-        args += ["-movflags", "+faststart", out_path]
 
-        code, out, err = run_cmd_capture(args, cwd=self.workdir)
-        if code != 0:
-            raise RuntimeError((err or "")[-4000:])
+        args += ["-progress", "pipe:1", out_path]
+
+        self._run_ffmpeg_with_progress(args, duration_sec, on_variant_progress)
 
         art = self._make_artifact_ref("main", filename, "video/mp4", out_path, {"variant_id": variant_id})
         self._set_variant_result(variant_id, label, [art])
 
-    def _encode_audio_variant(self, v, variant_id):
+    def _encode_audio_variant(self, v, variant_id, duration_sec, on_variant_progress):
         label = v.get("label") or ""
         bitrate = int(v.get("audio_bitrate_kbps") or 128)
         container = (v.get("container") or "m4a").lower() or "m4a"
@@ -617,6 +762,7 @@ class RedisConvertJob:
             ffmpeg,
             "-y",
             "-hide_banner",
+            "-nostats",
             "-loglevel",
             "error",
             "-i",
@@ -626,12 +772,12 @@ class RedisConvertJob:
             "aac",
             "-b:a",
             f"{bitrate}k",
+            "-progress",
+            "pipe:1",
             out_path,
         ]
 
-        code, out, err = run_cmd_capture(args, cwd=self.workdir)
-        if code != 0:
-            raise RuntimeError((err or "")[-4000:])
+        self._run_ffmpeg_with_progress(args, duration_sec, on_variant_progress)
 
         art = self._make_artifact_ref("main", filename, "audio/mp4", out_path, {"bitrate_kbps": bitrate, "variant_id": variant_id})
         self._set_variant_result(variant_id, label, [art])

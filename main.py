@@ -5,7 +5,7 @@ import time
 from dotenv import load_dotenv
 
 from config.app_cfg import load_app_cfg
-from jobs.convert_job import JobStore
+from jobs.redis_job import RedisJobStore as JobStore
 from services.grpc_srv import serve_grpc
 from services.info_srv import make_info_servicer
 from services.ytconvert_srv import make_converter_servicer
@@ -29,6 +29,8 @@ def main():
 
     logger = _configure_logging()
     cfg = load_app_cfg()
+
+    logger.info("cfg redis_url=%s redis_prefix=%s", cfg.get("redis_url"), cfg.get("redis_prefix"))
 
     ensure_dir(cfg["workdir"])
 
