@@ -819,3 +819,191 @@ class RedisConvertJob:
                 json.dump(idx, f)
         except Exception:
             pass
+
+####################
+    def _guess_mime_for_container(self, kind, container):
+        """
+        kind: "video" or "audio"
+        container: lower-case container/extension like "mp4", "webm", "mp3", "ogg", "m4a"
+        """
+        c = (container or "").strip().lower()
+
+        if kind == "video":
+            if c == "mp4":
+                return "video/mp4"
+            if c == "webm":
+                return "video/webm"
+            if c == "mkv":
+                return "video/x-matroska"
+            if c == "mov":
+                return "video/quicktime"
+            # fallback
+            return f"video/{c}" if c else "video/mp4"
+
+        # audio
+        if c == "mp3":
+            return "audio/mpeg"
+        if c == "ogg":
+            return "audio/ogg"
+        if c == "m4a":
+            # m4a is mp4 container with audio-only
+            return "audio/mp4"
+        if c == "wav":
+            return "audio/wav"
+        if c == "flac":
+            return "audio/flac"
+        # fallback
+        return f"audio/{c}" if c else "audio/mp4"
+
+    def _ffmpeg_codecs_for_video_container(self, container, vcodec, acodec):
+        """
+        Returns (v_args, a_args) lists to append to ffmpeg cmd.
+        Goal: respect requested container; keep behavior stable by defaulting to sane codecs.
+        """
+        c = (container or "").strip().lower()
+        vcodec = (vcodec or "h264").strip().lower()
+        acodec = (acodec or "aac").strip().lower()
+
+        if vcodec in ("auto", ""):
+            vcodec = "h264"
+        if acodec in ("auto", ""):
+            acodec = "aac"
+
+        # If user explicitly asked for copy - keep.
+        def map_v():
+            if vcodec == "copy":
+                return ["-c:v", "copy"]
+            if c == "webm":
+                # webm: vp9/vp8 are typical. We'll use libvpx-vp9 by default.
+                if vcodec in ("vp9", "libvpx-vp9"):
+                    return ["-c:v", "libvpx-vp9"]
+                if vcodec in ("vp8", "libvpx"):
+                    return ["-c:v", "libvpx"]
+                # fallback for webm:
+                return ["-c:v", "libvpx-vp9"]
+            # mp4 (and fallback): h264 default
+            if vcodec in ("h264", "libx264"):
+                return ["-c:v", "libx264"]
+            return ["-c:v", "libx264"]
+
+        def map_a():
+            if acodec == "copy":
+                return ["-c:a", "copy"]
+            if c == "webm":
+                # webm: opus/vorbis typical
+                if acodec in ("opus", "libopus"):
+                    return ["-c:a", "libopus"]
+                if acodec in ("vorbis", "libvorbis"):
+                    return ["-c:a", "libvorbis"]
+                # fallback for webm:
+                return ["-c:a", "libopus"]
+            # mp4 (and fallback): aac default
+            if acodec in ("aac",):
+                return ["-c:a", "aac"]
+            return ["-c:a", "aac"]
+
+        return map_v(), map_a()
+
+    def _ffmpeg_args_for_audio_container(self, container, bitrate_kbps):
+        """
+        Returns list of ffmpeg args for audio encoding (no video).
+        """
+        c = (container or "").strip().lower()
+        br = int(bitrate_kbps or 128)
+
+        # Note: keep it simple and predictable. If later you want passthrough/codec selection,
+        # you can extend variant options.
+        if c == "mp3":
+            return ["-c:a", "libmp3lame", "-b:a", f"{br}k"]
+        if c == "ogg":
+            # ogg typically uses libvorbis; bitrate mode is ok here.
+            return ["-c:a", "libvorbis", "-b:a", f"{br}k"]
+        if c == "m4a":
+            return ["-c:a", "aac", "-b:a", f"{br}k"]
+        # fallback: keep old behavior (aac in mp4/m4a-like), but preserve extension container
+        return ["-c:a", "aac", "-b:a", f"{br}k"]
+
+    def _encode_video_variant(self, v, variant_id, duration_sec, on_variant_progress):
+        label = v.get("label") or ""
+        height = int(v.get("height") or 0)
+        vcodec = (v.get("vcodec") or "h264").lower() or "h264"
+        acodec = (v.get("acodec") or "aac").lower() or "aac"
+        container = (v.get("container") or "mp4").lower() or "mp4"
+
+        # IMPORTANT: do NOT force container to mp4. Respect request.
+        # Filename must match container to avoid overwrites on client side.
+        # Include container in name so v_720p.mp4 and v_720p.webm are different.
+        if height > 0:
+            filename = f"v_{height}p.{container}"
+        else:
+            filename = f"v_source.{container}"
+
+        out_path = os.path.join(self.results_dir, filename)
+
+        vf = f"scale=-2:{height}" if height > 0 else None
+
+        ffmpeg = self.cfg["ffmpeg_bin"]
+        args = [ffmpeg, "-y", "-hide_banner", "-nostats", "-loglevel", "error", "-i", self.src_path]
+
+        if vf:
+            args += ["-vf", vf]
+
+        v_args, a_args = self._ffmpeg_codecs_for_video_container(container, vcodec, acodec)
+        args += v_args
+        args += a_args
+
+        # Explicitly set container format for ffmpeg to avoid ambiguity
+        # (especially when writing to a path with extension).
+        args += ["-f", container]
+
+        args += ["-progress", "pipe:1", out_path]
+
+        self._run_ffmpeg_with_progress(args, duration_sec, on_variant_progress)
+
+        mime = self._guess_mime_for_container("video", container)
+        art = self._make_artifact_ref("main", filename, mime, out_path, {"variant_id": variant_id, "container": container})
+        self._set_variant_result(variant_id, label, [art])
+
+    def _encode_audio_variant(self, v, variant_id, duration_sec, on_variant_progress):
+        label = v.get("label") or ""
+        bitrate = int(v.get("audio_bitrate_kbps") or 128)
+        container = (v.get("container") or "m4a").lower() or "m4a"
+
+        # IMPORTANT: do NOT force container to m4a. Respect request.
+        # Include container in filename to prevent overwrites.
+        filename = f"a_{bitrate}k.{container}"
+        out_path = os.path.join(self.results_dir, filename)
+
+        ffmpeg = self.cfg["ffmpeg_bin"]
+
+        args = [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-nostats",
+            "-loglevel",
+            "error",
+            "-i",
+            self.src_path,
+            "-vn",
+        ]
+
+        args += self._ffmpeg_args_for_audio_container(container, bitrate)
+
+        # Explicit container format (helps for ogg/mp3)
+        args += ["-f", container]
+
+        args += ["-progress", "pipe:1", out_path]
+
+        self._run_ffmpeg_with_progress(args, duration_sec, on_variant_progress)
+
+        mime = self._guess_mime_for_container("audio", container)
+        art = self._make_artifact_ref(
+            "main",
+            filename,
+            mime,
+            out_path,
+            {"bitrate_kbps": bitrate, "variant_id": variant_id, "container": container},
+        )
+        self._set_variant_result(variant_id, label, [art])
+
