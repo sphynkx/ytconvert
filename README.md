@@ -52,11 +52,11 @@ grpcurl -plaintext \
     "idempotency_key":"idem-001",
     "source":{
       "storage":{"address":"192.168.7.3:9092","tls":false,"token":""},
-      "rel_path":"test.mp4"
+      "rel_path":"4A/4AEc77Ra_9gE/original.webm"
     },
     "output":{
       "storage":{"address":"192.168.7.3:9092","tls":false,"token":""},
-      "base_rel_dir":"."
+      "base_rel_dir":"4A/4AEc77Ra_9gE"
     },
     "variants":[
       {"variant_id":"v:720p:h264+aac:mp4", "label":"720p", "kind":"VIDEO", "container":"mp4"},
