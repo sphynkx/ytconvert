@@ -50,6 +50,14 @@ grpcurl -plaintext \
   -d '{
     "video_id":"vid_test_001",
     "idempotency_key":"idem-001",
+    "source":{
+      "storage":{"address":"192.168.7.3:9092","tls":false,"token":""},
+      "rel_path":"test.mp4"
+    },
+    "output":{
+      "storage":{"address":"192.168.7.3:9092","tls":false,"token":""},
+      "base_rel_dir":"."
+    },
     "variants":[
       {"variant_id":"v:720p:h264+aac:mp4", "label":"720p", "kind":"VIDEO", "container":"mp4"},
       {"variant_id":"a:128k:aac:m4a", "label":"Audio 128k", "kind":"AUDIO", "container":"m4a"}

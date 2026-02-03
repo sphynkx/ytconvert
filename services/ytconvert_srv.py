@@ -1,13 +1,8 @@
-import os
 import time
-
 import grpc
-
-from google.protobuf import struct_pb2
 
 from jobs.redis_job import (
     STATE_QUEUED,
-    STATE_WAITING_UPLOAD,
     STATE_RUNNING,
     STATE_DONE,
     STATE_FAILED,
@@ -19,7 +14,6 @@ from utils.grpc_ut import dict_to_struct
 def _state_to_pb(state, pb2):
     m = {
         STATE_QUEUED: pb2.Status.QUEUED,
-        STATE_WAITING_UPLOAD: pb2.Status.WAITING_UPLOAD,
         STATE_RUNNING: pb2.Status.RUNNING,
         STATE_DONE: pb2.Status.DONE,
         STATE_FAILED: pb2.Status.FAILED,
@@ -83,6 +77,21 @@ def make_converter_servicer(converter_pb2_grpc, converter_pb2, cfg, logger, job_
                 logger.info("rpc SubmitConvert -> accepted=%s msg=%s dt_ms=%d", resp.accepted, resp.message, int((time.time() - t0) * 1000))
                 return resp
 
+            # Validate storage-driven refs
+            if not request.source or not request.source.storage or not (request.source.storage.address or "").strip():
+                resp = converter_pb2.JobAck(job_id="", accepted=False, message="source.storage.address is required", meta=dict_to_struct({"code": "BAD_REQUEST"}))
+                return resp
+            if not (request.source.rel_path or "").strip():
+                resp = converter_pb2.JobAck(job_id="", accepted=False, message="source.rel_path is required", meta=dict_to_struct({"code": "BAD_REQUEST"}))
+                return resp
+
+            if not request.output or not request.output.storage or not (request.output.storage.address or "").strip():
+                resp = converter_pb2.JobAck(job_id="", accepted=False, message="output.storage.address is required", meta=dict_to_struct({"code": "BAD_REQUEST"}))
+                return resp
+            if not (request.output.base_rel_dir or "").strip():
+                resp = converter_pb2.JobAck(job_id="", accepted=False, message="output.base_rel_dir is required", meta=dict_to_struct({"code": "BAD_REQUEST"}))
+                return resp
+
             variants = []
             for v in request.variants:
                 variants.append({
@@ -100,137 +109,43 @@ def make_converter_servicer(converter_pb2_grpc, converter_pb2, cfg, logger, job_
             options = dict(request.options) if request.options else {}
             idem = (request.idempotency_key or "").strip()
 
-            job, reused = job_store.create_job(video_id, variants, options, idempotency_key=idem)
+            src = {
+                "storage": {
+                    "address": request.source.storage.address,
+                    "tls": bool(request.source.storage.tls),
+                    "token": request.source.storage.token,
+                },
+                "rel_path": request.source.rel_path,
+            }
+            out = {
+                "storage": {
+                    "address": request.output.storage.address,
+                    "tls": bool(request.output.storage.tls),
+                    "token": request.output.storage.token,
+                },
+                "base_rel_dir": request.output.base_rel_dir,
+            }
+
+            job, reused = job_store.create_job(video_id, variants, options, idempotency_key=idem, source=src, output=out)
 
             msg = "accepted"
             if reused:
                 msg = "accepted (idempotent reuse)"
 
-            meta = {"next_offset": job.get_next_offset()}
             resp = converter_pb2.JobAck(
                 job_id=job.job_id,
                 accepted=True,
                 message=msg,
-                meta=dict_to_struct(meta),
+                meta=dict_to_struct({"queue": "redis"}),
             )
 
             logger.info(
-                "rpc SubmitConvert -> job_id=%s accepted=%s reused=%s next_offset=%s dt_ms=%d",
+                "rpc SubmitConvert -> job_id=%s accepted=%s reused=%s src=%s out=%s dt_ms=%d",
                 resp.job_id,
                 resp.accepted,
                 reused,
-                meta.get("next_offset"),
-                int((time.time() - t0) * 1000),
-            )
-            return resp
-
-        def UploadSource(self, request_iterator, context):
-            t0 = time.time()
-            peer = _peer(context)
-            logger.info("rpc UploadSource peer=%s md=%s", peer, _md(context))
-
-            first = True
-            job = None
-            chunks = 0
-            bytes_in = 0
-
-            for chunk in request_iterator:
-                chunks += 1
-                job_id = (chunk.job_id or "").strip()
-                if first:
-                    logger.info(
-                        "rpc UploadSource first_chunk job_id=%s offset=%d last=%s filename=%s content_type=%s total=%d",
-                        job_id,
-                        int(chunk.offset),
-                        bool(chunk.last),
-                        _short(chunk.filename),
-                        _short(chunk.content_type),
-                        int(chunk.total_size_bytes or 0),
-                    )
-
-                    if not job_id:
-                        resp = converter_pb2.UploadAck(
-                            job_id="",
-                            accepted=False,
-                            message="job_id is required",
-                            received_bytes=0,
-                            meta=dict_to_struct({"code": "BAD_REQUEST"}),
-                        )
-                        logger.info("rpc UploadSource -> accepted=%s msg=%s dt_ms=%d", resp.accepted, resp.message, int((time.time() - t0) * 1000))
-                        return resp
-
-                    job = job_store.get(job_id)
-                    if not job:
-                        resp = converter_pb2.UploadAck(
-                            job_id=job_id,
-                            accepted=False,
-                            message="job not found",
-                            received_bytes=0,
-                            meta=dict_to_struct({"code": "NOT_FOUND"}),
-                        )
-                        logger.info("rpc UploadSource -> accepted=%s msg=%s dt_ms=%d", resp.accepted, resp.message, int((time.time() - t0) * 1000))
-                        return resp
-
-                    first = False
-
-                data_len = len(chunk.data) if chunk.data else 0
-                bytes_in += data_len
-
-                ok, msg, received, next_off = job.append_upload_chunk(
-                    offset=int(chunk.offset),
-                    data=bytes(chunk.data) if chunk.data else b"",
-                    last=bool(chunk.last),
-                    filename=chunk.filename or "",
-                    content_type=chunk.content_type or "",
-                    total_size_bytes=int(chunk.total_size_bytes or 0),
-                )
-
-                if not ok:
-                    resp = converter_pb2.UploadAck(
-                        job_id=job.job_id,
-                        accepted=False,
-                        message=msg,
-                        received_bytes=int(received),
-                        meta=dict_to_struct({"next_offset": int(next_off)}),
-                    )
-                    logger.warning(
-                        "rpc UploadSource -> accepted=%s msg=%s received=%d next_offset=%d chunks=%d bytes_in=%d dt_ms=%d",
-                        resp.accepted,
-                        resp.message,
-                        int(received),
-                        int(next_off),
-                        chunks,
-                        bytes_in,
-                        int((time.time() - t0) * 1000),
-                    )
-                    logger.info("rpc UploadSource stream_end job_id=%s chunks=%d bytes_in=%d", job.job_id if job else "", chunks, bytes_in)
-                    return resp
-
-            if job is None:
-                resp = converter_pb2.UploadAck(
-                    job_id="",
-                    accepted=False,
-                    message="empty stream",
-                    received_bytes=0,
-                    meta=dict_to_struct({"code": "BAD_REQUEST"}),
-                )
-                logger.info("rpc UploadSource -> accepted=%s msg=%s dt_ms=%d", resp.accepted, resp.message, int((time.time() - t0) * 1000))
-                return resp
-
-            resp = converter_pb2.UploadAck(
-                job_id=job.job_id,
-                accepted=True,
-                message="ok",
-                received_bytes=int(job.received_bytes),
-                meta=dict_to_struct({"next_offset": int(job.get_next_offset())}),
-            )
-            logger.info(
-                "rpc UploadSource -> accepted=%s received=%d next_offset=%d chunks=%d bytes_in=%d dt_ms=%d",
-                resp.accepted,
-                resp.received_bytes,
-                int(job.get_next_offset()),
-                chunks,
-                bytes_in,
+                _short(request.source.rel_path),
+                _short(request.output.base_rel_dir),
                 int((time.time() - t0) * 1000),
             )
             return resp
@@ -254,13 +169,6 @@ def make_converter_servicer(converter_pb2_grpc, converter_pb2, cfg, logger, job_
                 message=job.message or "",
                 meta=dict_to_struct(job.meta or {}),
                 error=err,
-            )
-            logger.info(
-                "rpc GetStatus -> state=%s percent=%d msg=%s dt_ms=%d",
-                resp.state,
-                resp.percent,
-                _short(resp.message),
-                int((time.time() - t0) * 1000),
             )
             return resp
 
@@ -286,14 +194,6 @@ def make_converter_servicer(converter_pb2_grpc, converter_pb2, cfg, logger, job_
                 meta=dict_to_struct(job.meta or {}),
                 error=err,
             )
-            logger.info(
-                "rpc GetPartialResult -> state=%s percent=%d ready=%d/%d dt_ms=%d",
-                resp.state,
-                resp.percent,
-                len(resp.ready_variant_ids),
-                resp.total_variants,
-                int((time.time() - t0) * 1000),
-            )
             return resp
 
         def GetResult(self, request, context):
@@ -316,7 +216,7 @@ def make_converter_servicer(converter_pb2_grpc, converter_pb2, cfg, logger, job_
                         mime=a.get("mime", ""),
                         size_bytes=int(a.get("size_bytes") or 0),
                         sha256=bytes.fromhex(a.get("sha256", "")) if a.get("sha256") else b"",
-                        inline_bytes=b"",
+                        rel_path=a.get("rel_path", ""),
                         meta=dict_to_struct(a.get("meta", {})),
                     ))
                 results_map[variant_id] = converter_pb2.VariantResult(
@@ -344,95 +244,6 @@ def make_converter_servicer(converter_pb2_grpc, converter_pb2, cfg, logger, job_
                 int((time.time() - t0) * 1000),
             )
             return resp
-
-        def DownloadResult(self, request, context):
-            t0 = time.time()
-            logger.info(
-                "rpc DownloadResult peer=%s job_id=%s variant_id=%s artifact_id=%s offset=%d",
-                _peer(context),
-                _short(request.job_id),
-                _short(request.variant_id),
-                _short(request.artifact_id),
-                int(request.offset or 0),
-            )
-
-            job_id = (request.job_id or "").strip()
-            variant_id = (request.variant_id or "").strip()
-            artifact_id = (request.artifact_id or "").strip()
-            offset = int(request.offset or 0)
-
-            job = job_store.get(job_id)
-            if not job:
-                context.abort(grpc.StatusCode.NOT_FOUND, "job not found")
-
-            vr = (job.results_by_variant_id or {}).get(variant_id)
-            if not vr:
-                context.abort(grpc.StatusCode.NOT_FOUND, "variant not found")
-
-            artifact = None
-            for a in vr.get("artifacts", []):
-                if a.get("artifact_id") == artifact_id:
-                    artifact = a
-                    break
-            if not artifact:
-                context.abort(grpc.StatusCode.NOT_FOUND, "artifact not found")
-
-            path = artifact.get("path")
-            if not path or not os.path.exists(path):
-                context.abort(grpc.StatusCode.NOT_FOUND, "artifact file missing")
-
-            total = int(artifact.get("size_bytes") or 0)
-            if offset < 0 or offset > total:
-                context.abort(grpc.StatusCode.OUT_OF_RANGE, "bad offset")
-
-            logger.info(
-                "rpc DownloadResult serving filename=%s size=%d mime=%s",
-                artifact.get("filename", ""),
-                total,
-                artifact.get("mime", ""),
-            )
-
-            chunk_size = int(cfg.get("download_chunk_bytes") or (1024 * 1024))
-
-            sent = 0
-            with open(path, "rb") as f:
-                f.seek(offset)
-                cur = offset
-                first = True
-                while True:
-                    b = f.read(chunk_size)
-                    if not b:
-                        yield converter_pb2.DownloadChunk(
-                            offset=int(cur),
-                            data=b"",
-                            last=True,
-                            filename=artifact.get("filename", "") if first else "",
-                            mime=artifact.get("mime", "") if first else "",
-                            total_size_bytes=total if first else 0,
-                            sha256_total=bytes.fromhex(artifact.get("sha256", "")) if (first and artifact.get("sha256")) else b"",
-                        )
-                        break
-
-                    next_off = cur + len(b)
-                    last = next_off >= total
-                    sent += len(b)
-
-                    yield converter_pb2.DownloadChunk(
-                        offset=int(cur),
-                        data=b,
-                        last=bool(last),
-                        filename=artifact.get("filename", "") if first else "",
-                        mime=artifact.get("mime", "") if first else "",
-                        total_size_bytes=total if first else 0,
-                        sha256_total=bytes.fromhex(artifact.get("sha256", "")) if (first and artifact.get("sha256")) else b"",
-                    )
-
-                    first = False
-                    cur = next_off
-                    if last:
-                        break
-
-            logger.info("rpc DownloadResult done sent=%d dt_ms=%d", sent, int((time.time() - t0) * 1000))
 
         def WatchJob(self, request, context):
             logger.info(
@@ -505,30 +316,23 @@ def make_converter_servicer(converter_pb2_grpc, converter_pb2, cfg, logger, job_
                     or message != last_message
                     or meta_json != last_meta_json
                 )
-
                 ready_changed = (ready != last_ready)
 
                 if status_changed:
-                    st = make_status()
-                    yield converter_pb2.JobEvent(type=converter_pb2.JobEvent.STATUS, status=st)
-
+                    yield converter_pb2.JobEvent(type=converter_pb2.JobEvent.STATUS, status=make_status())
                     last_state = state
                     last_percent = percent
                     last_message = message
                     last_meta_json = meta_json
 
                 if ready_changed or state in (STATE_DONE, STATE_FAILED, STATE_CANCELED):
-                    partial = make_partial(ready)
-                    yield converter_pb2.JobEvent(type=converter_pb2.JobEvent.PARTIAL, partial=partial)
+                    yield converter_pb2.JobEvent(type=converter_pb2.JobEvent.PARTIAL, partial=make_partial(ready))
                     last_ready = ready
 
                 if state == STATE_DONE:
-                    logger.info("rpc WatchJob job_id=%s DONE", job_id)
                     yield converter_pb2.JobEvent(type=converter_pb2.JobEvent.DONE, partial=make_partial(ready))
                     return
-
                 if state == STATE_FAILED:
-                    logger.info("rpc WatchJob job_id=%s FAILED", job_id)
                     yield converter_pb2.JobEvent(type=converter_pb2.JobEvent.FAILED, partial=make_partial(ready))
                     return
 

@@ -5,6 +5,36 @@ package ytconvert.v1;
 import "google/protobuf/struct.proto";
 
 // ------------------------------------------------------------
+// Storage-driven IO refs (ytstorage)
+// ------------------------------------------------------------
+
+message StorageRef {
+  // gRPC host:port of ytstorage
+  string address = 1;
+
+  // reserved for future
+  bool tls = 2;
+
+  // bearer token for ytstorage
+  string token = 3;
+}
+
+message SourceRef {
+  StorageRef storage = 1;
+
+  // path relative to storage root, e.g. "RV/RVxxxx/original.webm"
+  string rel_path = 2;
+}
+
+message OutputRef {
+  StorageRef storage = 1;
+
+  // base directory (rel) where to put results (same as original folder)
+  // e.g. "RV/RVxxxx"
+  string base_rel_dir = 2;
+}
+
+// ------------------------------------------------------------
 // Common
 // ------------------------------------------------------------
 
@@ -12,82 +42,72 @@ message JobAck {
   string job_id = 1;
   bool accepted = 2;
   string message = 3;
-  google.protobuf.Struct meta = 4; // { "queue":"...", "eta_sec":123, "next_offset":..., ... }
+  google.protobuf.Struct meta = 4;
 }
 
 message ErrorInfo {
-  string code = 1;                 // free-form string code, e.g. "FFMPEG_FAILED", "BAD_REQUEST"
-  string message = 2;              // human-readable
-  google.protobuf.Struct meta = 3; // any other details (stderr snippet, exit_code, etc)
+  string code = 1;
+  string message = 2;
+  google.protobuf.Struct meta = 3;
 }
 
 message VariantSpec {
-  // Stable id from the app/UI. Must be unique within a job.
-  // Examples:
-  //   "v:1440p:h264+aac:mp4"
-  //   "a:128k:aac:m4a"
   string variant_id = 1;
-
-  // Human-friendly label, optional (for logs/UI).
-  // Examples: "1440p", "Audio only (128k)"
   string label = 2;
 
   enum Kind {
     KIND_UNSPECIFIED = 0;
     VIDEO = 1;
     AUDIO = 2;
-    HLS = 3;   // future
-    DASH = 4;  // future
+    HLS = 3;
+    DASH = 4;
     OTHER = 10;
   }
   Kind kind = 3;
 
-  // Container hint: "mp4", "webm", "m4a", "mp3", "m3u8" (future), etc.
+  // desired container/ext, e.g. "mp4", "webm", "m4a", "mp3", "ogg"
   string container = 4;
 
-  // Video options
-  int32 height = 5;                // target height (px), keep aspect ratio; 0 => keep source
-  string vcodec = 6;               // "h264", "vp9", "av1", "copy", "auto"
-  string acodec = 7;               // "aac", "opus", "copy", "auto"
+  int32 height = 5;
+  string vcodec = 6;
+  string acodec = 7;
+  int32 audio_bitrate_kbps = 8;
 
-  // Audio options
-  int32 audio_bitrate_kbps = 8;    // e.g. 128
-
-  google.protobuf.Struct options = 20; // any other encoder/muxer options
+  google.protobuf.Struct options = 20;
 }
 
 message Status {
   enum State {
     STATE_UNSPECIFIED = 0;
     QUEUED = 1;
-    WAITING_UPLOAD = 2;
-    RUNNING = 3;
-    DONE = 4;
-    FAILED = 5;
-    CANCELED = 6;
+    RUNNING = 2;
+    DONE = 3;
+    FAILED = 4;
+    CANCELED = 5;
   }
 
   string job_id = 1;
   string video_id = 2;
   State state = 3;
   int32 percent = 4;               // 0..100
-  string message = 5;              // status/error desc
-  google.protobuf.Struct meta = 6; // { "stage":"ENCODE", "variant":"v:720p:...", ... }
-  ErrorInfo error = 7;             // set when FAILED (optional)
+  string message = 5;
+  google.protobuf.Struct meta = 6; // { "stage":"DOWNLOAD|PROBE|ENCODE|UPLOAD", "variant":"...", ... }
+  ErrorInfo error = 7;
 }
 
 message SubmitConvertRequest {
   string video_id = 1;
 
-  // Optional: to make retries safe. If provided, service should return the same job_id
-  // for the same idempotency_key (best-effort).
+  // Optional: retries-safe key (best-effort)
   string idempotency_key = 2;
 
-  // Selected target variants.
-  repeated VariantSpec variants = 3;
+  // Storage-driven input and output
+  SourceRef source = 3;
+  OutputRef output = 4;
 
-  // Optional extra knobs (priority, hints, etc.)
-  google.protobuf.Struct options = 4; // { "priority":1, "keep_intermediate":false, ... }
+  repeated VariantSpec variants = 5;
+
+  google.protobuf.Struct options = 6; // priority, keep_intermediate, etc.
 }
 
 message GetStatusRequest {
@@ -103,57 +123,18 @@ message PartialConvertResult {
   string job_id = 1;
   string video_id = 2;
   Status.State state = 3;
-  int32 percent = 4;               // 0..100 (best-effort)
-  string message = 5;              // status/error desc
+  int32 percent = 4;
+  string message = 5;
 
-  // Which variant_ids are already fully available for download.
   repeated string ready_variant_ids = 6;
+  int32 total_variants = 7;
 
-  int32 total_variants = 7;        // how many variants were requested (if known)
-  google.protobuf.Struct meta = 8; // optional extra info (stage, timings, etc.)
-  ErrorInfo error = 9;             // set when FAILED (optional)
+  google.protobuf.Struct meta = 8;
+  ErrorInfo error = 9;
 }
 
 // ------------------------------------------------------------
-// Upload source (streaming)
-// ------------------------------------------------------------
-
-message UploadSourceChunk {
-  string job_id = 1;
-
-  // Offset of this data chunk in the full source stream.
-  // For sequential upload: 0, len(chunk0), len(chunk0)+len(chunk1), ...
-  int64 offset = 2;
-
-  // Raw bytes of the original file.
-  bytes data = 3;
-
-  // If true, this is the final chunk (end of stream).
-  bool last = 4;
-
-  // Optional metadata (send in first chunk ideally).
-  string filename = 10;
-  string content_type = 11;  // e.g. "video/webm"
-
-  // Optional: total size and/or checksum (best-effort).
-  int64 total_size_bytes = 12;
-  bytes sha256_total = 13;   // 32 bytes if provided
-}
-
-message UploadAck {
-  string job_id = 1;
-  bool accepted = 2;
-  string message = 3;
-
-  // How many bytes are stored/accepted by the service so far.
-  int64 received_bytes = 4;
-
-  // Extra info: { "next_offset":12345 }
-  google.protobuf.Struct meta = 5;
-}
-
-// ------------------------------------------------------------
-// Results and download (streaming)
+// Results
 // ------------------------------------------------------------
 
 message GetResultRequest {
@@ -161,31 +142,22 @@ message GetResultRequest {
 }
 
 message ArtifactRef {
-  // Unique id of artifact within a variant.
-  // Examples: "main", "video", "audio", "manifest", "log"
-  string artifact_id = 1;
-
-  // Suggested filename (not a filesystem path on the server).
+  string artifact_id = 1;  // e.g. "main"
   string filename = 2;
-
-  string mime = 3;          // e.g. "video/mp4"
+  string mime = 3;
   int64 size_bytes = 4;
+  bytes sha256 = 5;
 
-  bytes sha256 = 5;         // 32 bytes (optional)
+  // Storage-driven: where it was written
+  string rel_path = 6;
 
-  // If this artifact is small, service MAY inline it here. Otherwise it should be empty.
-  bytes inline_bytes = 6;
-
-  google.protobuf.Struct meta = 10; // any extra (bitrate, duration_ms, ffmpeg args, etc)
+  google.protobuf.Struct meta = 10;
 }
 
 message VariantResult {
   string variant_id = 1;
   string label = 2;
-
-  // Each variant may produce multiple files (future: HLS playlists, segments, logs).
   repeated ArtifactRef artifacts = 3;
-
   google.protobuf.Struct meta = 10;
 }
 
@@ -193,34 +165,12 @@ message ConvertResult {
   string job_id = 1;
   string video_id = 2;
 
-  Status.State state = 3;             // DONE/FAILED
+  Status.State state = 3; // DONE/FAILED
   string message = 4;
   google.protobuf.Struct meta = 5;
-  ErrorInfo error = 6;                // set when FAILED (optional)
+  ErrorInfo error = 6;
 
-  // Keyed by variant_id for easy mapping.
   map<string, VariantResult> results_by_variant_id = 10;
-}
-
-message DownloadRequest {
-  string job_id = 1;
-  string variant_id = 2;
-  string artifact_id = 3;
-
-  // Optional: resume download from offset (bytes).
-  int64 offset = 4;
-}
-
-message DownloadChunk {
-  int64 offset = 1;
-  bytes data = 2;
-  bool last = 3;
-
-  // Optional: service can repeat metadata in first chunk
-  string filename = 10;
-  string mime = 11;
-  int64 total_size_bytes = 12;
-  bytes sha256_total = 13; // 32 bytes if provided
 }
 
 // ------------------------------------------------------------
@@ -229,8 +179,6 @@ message DownloadChunk {
 
 message WatchJobRequest {
   string job_id = 1;
-
-  // Optional: if true, send current status immediately as first event.
   bool send_initial = 2;
 }
 
@@ -245,7 +193,6 @@ message JobEvent {
   }
   Type type = 1;
 
-  // Oneof payload; service may send status updates and partial results.
   Status status = 2;
   PartialConvertResult partial = 3;
 }
@@ -255,24 +202,9 @@ message JobEvent {
 // ------------------------------------------------------------
 
 service Converter {
-  // Create a conversion job (no file data here).
   rpc SubmitConvert (SubmitConvertRequest) returns (JobAck);
-
-  // Upload original file bytes (streaming). Must support resume with offset (best-effort).
-  rpc UploadSource (stream UploadSourceChunk) returns (UploadAck);
-
-  // Poll job state.
   rpc GetStatus (GetStatusRequest) returns (Status);
-
-  // Partial progress while RUNNING/WAITING_UPLOAD; MUST NOT fail with FAILED_PRECONDITION for RUNNING.
   rpc GetPartialResult (GetPartialResultRequest) returns (PartialConvertResult);
-
-  // Final results (or error) once DONE/FAILED.
   rpc GetResult (GetResultRequest) returns (ConvertResult);
-
-  // Download a specific artifact as a byte stream (supports resume via offset).
-  rpc DownloadResult (DownloadRequest) returns (stream DownloadChunk);
-
-  // Optional: server-stream events for a job (alternative to polling).
   rpc WatchJob (WatchJobRequest) returns (stream JobEvent);
 }

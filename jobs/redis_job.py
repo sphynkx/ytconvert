@@ -7,6 +7,7 @@ import subprocess
 import time
 
 import redis
+import grpc
 
 from utils.time_ut import now_ts
 from utils.files_ut import ensure_dir, rm_tree
@@ -15,7 +16,6 @@ from utils.hash_ut import sha256_file
 
 
 STATE_QUEUED = 1
-STATE_WAITING_UPLOAD = 2
 STATE_RUNNING = 3
 STATE_DONE = 4
 STATE_FAILED = 5
@@ -110,6 +110,158 @@ def parse_variant_id(variant_id):
     return out
 
 
+def _norm_rel(p: str) -> str:
+    return (p or "").strip().replace("\\", "/").lstrip("/")
+
+
+def _join_rel(a: str, b: str) -> str:
+    a = _norm_rel(a)
+    b = _norm_rel(b)
+    if not a:
+        return b
+    if not b:
+        return a
+    return f"{a}/{b}"
+
+
+def _auth_md(token: str):
+    t = (token or "").strip()
+    if not t:
+        return []
+    return [("authorization", f"Bearer {t}")]
+
+
+def _grpc_opts():
+    max_mb = int(os.getenv("YTCONVERT_YTSTORAGE_GRPC_MAX_MB", "64"))
+    max_msg = max_mb * 1024 * 1024
+    return [
+        ("grpc.max_send_message_length", max_msg),
+        ("grpc.max_receive_message_length", max_msg),
+    ]
+
+
+def _make_channel(addr: str, tls: bool):
+    if tls:
+        return grpc.secure_channel(addr, grpc.ssl_channel_credentials(), options=_grpc_opts())
+    return grpc.insecure_channel(addr, options=_grpc_opts())
+
+
+try:
+    from proto import ytstorage_pb2 as spb  # type: ignore
+    from proto import ytstorage_pb2_grpc as sgrpc  # type: ignore
+except Exception:
+    spb = None  # type: ignore
+    sgrpc = None  # type: ignore
+
+
+def _storage_addr(st: dict) -> str:
+    if not st:
+        return ""
+    for k in ("address", "hostport", "target"):
+        v = str(st.get(k) or "").strip()
+        if v:
+            return v
+    host = str(st.get("host") or "").strip()
+    port = str(st.get("port") or "").strip()
+    if host and port:
+        return f"{host}:{port}"
+    return ""
+
+
+def _download_from_storage(addr: str, tls: bool, token: str, rel_path: str, dst_path: str, logger, job_id: str):
+    if spb is None or sgrpc is None:
+        raise RuntimeError("ytstorage stubs not found (expected proto/ytstorage_pb2*.py)")
+
+    rel_path = _norm_rel(rel_path)
+    ensure_dir(os.path.dirname(dst_path))
+
+    md = _auth_md(token)
+    bytes_written = 0
+
+    with _make_channel(addr, tls) as ch:
+        stub = sgrpc.StorageServiceStub(ch)
+        stream = stub.Read(
+            spb.ReadRequest(
+                path=spb.Path(rel_path=rel_path),
+                offset=0,
+                length=-1,
+            ),
+            metadata=md,
+        )
+        with open(dst_path, "wb") as f:
+            for msg in stream:
+                data = bytes(getattr(msg, "data", b"") or b"")
+                if not data:
+                    continue
+                f.write(data)
+                bytes_written += len(data)
+                if bytes_written and (bytes_written % (256 * 1024 * 1024) == 0):
+                    logger.info("job %s: DOWNLOAD %d MB...", job_id, bytes_written // (1024 * 1024))
+
+    return bytes_written
+
+
+def _mkdirs_storage(addr: str, tls: bool, token: str, rel_dir: str):
+    if spb is None or sgrpc is None:
+        raise RuntimeError("ytstorage stubs not found (expected proto/ytstorage_pb2*.py)")
+    md = _auth_md(token)
+    with _make_channel(addr, tls) as ch:
+        stub = sgrpc.StorageServiceStub(ch)
+        resp = stub.Mkdirs(
+            spb.MkdirsRequest(path=spb.Path(rel_path=_norm_rel(rel_dir)), exist_ok=True),
+            metadata=md,
+        )
+        if not getattr(resp, "ok", False):
+            raise RuntimeError("ytstorage Mkdirs failed")
+
+
+def _upload_file_to_storage(addr: str, tls: bool, token: str, rel_path: str, src_path: str):
+    if spb is None or sgrpc is None:
+        raise RuntimeError("ytstorage stubs not found (expected proto/ytstorage_pb2*.py)")
+    md = _auth_md(token)
+    rel_path = _norm_rel(rel_path)
+
+    def gen():
+        yield spb.WriteEnvelope(
+            header=spb.WriteHeader(
+                path=spb.Path(rel_path=rel_path),
+                overwrite=True,
+                append=False,
+                expected_size=0,
+                etag="",
+            )
+        )
+        with open(src_path, "rb") as f:
+            while True:
+                b = f.read(1024 * 1024)
+                if not b:
+                    break
+                yield spb.WriteEnvelope(data=spb.WriteData(data=b))
+
+    last = None
+    with _make_channel(addr, tls) as ch:
+        stub = sgrpc.StorageServiceStub(ch)
+        for ack in stub.Write(gen(), metadata=md):
+            last = ack
+
+    if last and getattr(last, "ok", False):
+        return int(getattr(last, "bytes_written", 0) or 0)
+
+    raise RuntimeError(f"ytstorage upload failed: {getattr(last, 'error', '')}")
+
+
+def _ffmpeg_muxer_for_container(container: str) -> str:
+    """
+    Map "container" (extension-ish) to a valid ffmpeg muxer name.
+    Important case: m4a is an extension, muxer is mp4.
+    """
+    c = (container or "").strip().lower()
+    if c == "m4a":
+        return "mp4"
+    # usually fine:
+    return c or "mp4"
+
+
 class RedisJobStore:
     def __init__(self, cfg, logger):
         self.cfg = cfg
@@ -137,7 +289,6 @@ class RedisJobStore:
         try:
             total = self.redis.scard(self._job_ids_set_key())
             queued = self.redis.scard(self._state_set_key(STATE_QUEUED))
-            waiting = self.redis.scard(self._state_set_key(STATE_WAITING_UPLOAD))
             running = self.redis.scard(self._state_set_key(STATE_RUNNING))
             done = self.redis.scard(self._state_set_key(STATE_DONE))
             failed = self.redis.scard(self._state_set_key(STATE_FAILED))
@@ -145,19 +296,18 @@ class RedisJobStore:
         except Exception:
             return {}
 
-        active = queued + waiting + running
+        active = queued + running
         return {
             "jobs_total": float(total),
             "jobs_active": float(active),
             "jobs_queued": float(queued),
-            "jobs_waiting_upload": float(waiting),
             "jobs_running": float(running),
             "jobs_done": float(done),
             "jobs_failed": float(failed),
             "jobs_canceled": float(canceled),
         }
 
-    def create_job(self, video_id, variants, options, idempotency_key=""):
+    def create_job(self, video_id, variants, options, idempotency_key="", source=None, output=None):
         with self._lock:
             if idempotency_key:
                 try:
@@ -179,33 +329,34 @@ class RedisJobStore:
             job_fields = {
                 "job_id": job_id,
                 "video_id": video_id,
-                "state": str(STATE_WAITING_UPLOAD),
+                "state": str(STATE_QUEUED),
                 "percent": "0",
-                "message": "waiting upload",
-                "meta_json": _j({}),
+                "message": "queued",
+                "meta_json": _j({"stage": "QUEUED"}),
                 "error_json": _j({}),
                 "created_at_ts": str(now),
                 "started_at_ts": "0",
                 "finished_at_ts": "0",
-                "received_bytes": "0",
-                "expected_offset": "0",
-                "upload_done": "0",
                 "variants_json": _j(variants or []),
                 "options_json": _j(options or {}),
                 "ready_variant_ids_json": _j([]),
                 "results_by_variant_id_json": _j({}),
                 "duration_sec": "0",
+                "source_json": _j(source or {}),
+                "output_json": _j(output or {}),
             }
 
             pipe = self.redis.pipeline()
             pipe.hset(self._job_key(job_id), mapping=job_fields)
             pipe.sadd(self._job_ids_set_key(), job_id)
-            pipe.sadd(self._state_set_key(STATE_WAITING_UPLOAD), job_id)
+            pipe.sadd(self._state_set_key(STATE_QUEUED), job_id)
             if idempotency_key:
                 pipe.set(self._idem_key(idempotency_key), job_id)
             pipe.execute()
 
             self.logger.info("redis: created job_id=%s video_id=%s variants=%d", job_id, video_id, len(variants or []))
+
+            job._start_worker_async()
             return job, False
 
     def get(self, job_id):
@@ -263,14 +414,7 @@ class RedisJobStore:
                 pipe = self.redis.pipeline()
                 pipe.delete(k)
                 pipe.srem(self._job_ids_set_key(), jid)
-                for st in (
-                    STATE_QUEUED,
-                    STATE_WAITING_UPLOAD,
-                    STATE_RUNNING,
-                    STATE_DONE,
-                    STATE_FAILED,
-                    STATE_CANCELED,
-                ):
+                for st in (STATE_QUEUED, STATE_RUNNING, STATE_DONE, STATE_FAILED, STATE_CANCELED):
                     pipe.srem(self._state_set_key(st), jid)
                 pipe.execute()
             except Exception:
@@ -341,14 +485,12 @@ class RedisConvertJob:
         return self._hget_json("results_by_variant_id_json", {})
 
     @property
-    def received_bytes(self):
-        return _i(self._hget("received_bytes"), 0)
+    def source(self):
+        return self._hget_json("source_json", {}) or {}
 
-    def get_next_offset(self):
-        return _i(self._hget("expected_offset"), 0)
-
-    def is_terminal(self):
-        return self.state in (STATE_DONE, STATE_FAILED, STATE_CANCELED)
+    @property
+    def output(self):
+        return self._hget_json("output_json", {}) or {}
 
     def _key(self):
         return self.store._job_key(self.job_id)
@@ -401,7 +543,7 @@ class RedisConvertJob:
         pipe.execute()
 
     def _fail(self, code, message, meta=None):
-        self.logger.error("job %s: FAILED code=%s message=%s", self.job_id, code, message)
+        self.logger.error("job %s: FAILED code=%s message=%s meta=%s", self.job_id, code, message, meta or {})
         err = {"code": code, "message": message, "meta": meta or {}}
         self._hset_json("error_json", err)
         self._set_state(STATE_FAILED, percent=max(self.percent, 0), message=message, meta=self.meta)
@@ -409,48 +551,6 @@ class RedisConvertJob:
     def _done(self):
         self._set_state(STATE_DONE, percent=100, message="done", meta=self.meta)
         self.logger.info("job %s: DONE", self.job_id)
-
-    def append_upload_chunk(self, offset, data, last, filename="", content_type="", total_size_bytes=0):
-        if self.is_terminal():
-            return False, "job already finished", self.received_bytes, self.get_next_offset()
-
-        expected = self.get_next_offset()
-        if int(offset) != int(expected):
-            self.logger.warning("job %s: upload bad offset got=%d expected=%d", self.job_id, int(offset), int(expected))
-            return False, "bad offset", self.received_bytes, expected
-
-        if data:
-            max_bytes = int(self.cfg.get("max_upload_bytes") or 0)
-            if max_bytes > 0 and (self.received_bytes + len(data)) > max_bytes:
-                self._fail("UPLOAD_TOO_LARGE", "Upload exceeds max size", {"max_upload_bytes": max_bytes})
-                return False, "upload too large", self.received_bytes, self.get_next_offset()
-
-            with open(self.src_path, "ab") as f:
-                f.write(data)
-
-            new_received = self.received_bytes + len(data)
-            new_expected = expected + len(data)
-            self._hset({"received_bytes": str(int(new_received)), "expected_offset": str(int(new_expected))})
-
-            if not os.path.exists(self.src_meta_path):
-                meta = {
-                    "filename": filename or "",
-                    "content_type": content_type or "",
-                    "total_size_bytes": int(total_size_bytes or 0),
-                }
-                try:
-                    with open(self.src_meta_path, "w", encoding="utf-8") as f:
-                        json.dump(meta, f)
-                except Exception:
-                    pass
-
-        if last:
-            self._hset({"upload_done": "1"})
-            self.logger.info("job %s: upload finished received=%d", self.job_id, int(self.received_bytes))
-            if self.state == STATE_WAITING_UPLOAD:
-                self._start_worker_async()
-
-        return True, "ok", self.received_bytes, self.get_next_offset()
 
     def _start_worker_async(self):
         lock_key = self.store._k(f"lock:jobrun:{self.job_id}")
@@ -467,14 +567,370 @@ class RedisConvertJob:
         t = threading.Thread(target=self._run_convert, name=f"job-{self.job_id}", daemon=True)
         t.start()
 
+    def _publish_progress(self, job_percent, meta):
+        now_mono = time.monotonic()
+        job_percent = clamp_int(job_percent, 0, 99) if self.state == STATE_RUNNING else clamp_int(job_percent, 0, 100)
+
+        if (now_mono - self._last_progress_ts) < 0.8 and job_percent == self._last_job_percent:
+            return
+
+        self._last_progress_ts = now_mono
+        self._last_job_percent = job_percent
+
+        self._set_state(self.state, percent=job_percent, message=str(meta.get("stage") or "running"), meta=meta or {})
+
+    def _calc_job_percent(self, progresses, weights):
+        if not progresses:
+            return 0
+        if not weights or len(weights) != len(progresses):
+            return clamp_int(sum(progresses) / max(len(progresses), 1), 0, 100)
+
+        sw = float(sum(weights)) if weights else 1.0
+        if sw <= 0:
+            sw = 1.0
+        acc = 0.0
+        for p, w in zip(progresses, weights):
+            acc += float(p) * float(w)
+        return clamp_int(acc / sw, 0, 100)
+
+    def _mark_variant_ready(self, variant_id):
+        ready = sorted(list(self.ready_variant_ids.union({variant_id})))
+        self._hset_json("ready_variant_ids_json", ready)
+        self._persist_results_index()
+
+    def _persist_results_index(self):
+        idx = {
+            "job_id": self.job_id,
+            "video_id": self.video_id,
+            "results_by_variant_id": self.results_by_variant_id,
+            "ready_variant_ids": sorted(list(self.ready_variant_ids)),
+        }
+        try:
+            with open(self.results_index_path, "w", encoding="utf-8") as f:
+                json.dump(idx, f)
+        except Exception:
+            pass
+
+    def _probe_duration_sec(self):
+        ffprobe = self.cfg["ffprobe_bin"]
+        args = [
+            ffprobe,
+            "-v", "error",
+            "-show_format",
+            "-show_streams",
+            "-of", "json",
+            self.src_path,
+        ]
+        code, out, err = run_cmd_capture(args, cwd=self.workdir)
+        if code != 0:
+            self._fail("FFPROBE_FAILED", "ffprobe failed", {"exit_code": code, "stderr": (err or "")[-4000:]})
+            raise RuntimeError("ffprobe failed")
+
+        try:
+            info = json.loads(out) if out else {}
+        except Exception:
+            info = {}
+
+        duration_sec = 0.0
+        fmt = info.get("format") or {}
+        duration_str = fmt.get("duration")
+        duration_sec = _f(duration_str, 0.0)
+
+        if duration_sec <= 0:
+            streams = info.get("streams") or []
+            for s in streams:
+                d = _f(s.get("duration"), 0.0)
+                if d > duration_sec:
+                    duration_sec = d
+
+        duration_sec = float(duration_sec or 0.0)
+        if duration_sec <= 0:
+            duration_sec = 1.0
+
+        meta = {"stage": "PROBE", "duration_sec": float(duration_sec)}
+        self._set_state(self.state, percent=self.percent, message=self.message, meta=meta)
+        self.logger.info("job %s: PROBE ok duration_sec=%.3f", self.job_id, duration_sec)
+        return duration_sec
+
+    def _run_ffmpeg_with_progress(self, args, duration_sec, on_progress):
+        p = subprocess.Popen(
+            args,
+            cwd=self.workdir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+        )
+
+        out_time_ms = 0
+        speed = ""
+        last_vpct = -1
+
+        def emit(vpct):
+            nonlocal last_vpct
+            vpct = clamp_int(vpct, 0, 100)
+            if vpct == last_vpct:
+                return
+            last_vpct = vpct
+            if on_progress:
+                on_progress(vpct, {"current_out_time_sec": float(out_time_ms) / 1_000_000.0, "speed": speed})
+
+        try:
+            if not p.stdout:
+                raise RuntimeError("ffmpeg stdout is not available")
+
+            for line in p.stdout:
+                line = (line or "").strip()
+                if not line or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+
+                if k == "out_time_ms":
+                    try:
+                        out_time_ms = int(v)
+                    except Exception:
+                        out_time_ms = 0
+                    out_sec = float(out_time_ms) / 1_000_000.0
+                    vpct = int((out_sec / float(duration_sec)) * 100.0)
+                    vpct = clamp_int(vpct, 0, 99)
+                    emit(vpct)
+
+                elif k == "speed":
+                    speed = v
+
+                elif k == "progress" and v == "end":
+                    emit(100)
+
+        finally:
+            rc = p.wait()
+            stderr = ""
+            try:
+                if p.stderr:
+                    stderr = p.stderr.read() or ""
+            except Exception:
+                stderr = ""
+            if rc != 0:
+                raise RuntimeError(stderr[-4000:])
+
+    def _guess_mime_for_container(self, kind, container):
+        c = (container or "").strip().lower()
+
+        if kind == "video":
+            if c == "mp4":
+                return "video/mp4"
+            if c == "webm":
+                return "video/webm"
+            if c == "mkv":
+                return "video/x-matroska"
+            if c == "mov":
+                return "video/quicktime"
+            return f"video/{c}" if c else "video/mp4"
+
+        if c == "mp3":
+            return "audio/mpeg"
+        if c == "ogg":
+            return "audio/ogg"
+        if c == "m4a":
+            return "audio/mp4"
+        if c == "wav":
+            return "audio/wav"
+        if c == "flac":
+            return "audio/flac"
+        return f"audio/{c}" if c else "audio/mp4"
+
+    def _ffmpeg_codecs_for_video_container(self, container, vcodec, acodec):
+        c = (container or "").strip().lower()
+        vcodec = (vcodec or "h264").strip().lower()
+        acodec = (acodec or "aac").strip().lower()
+
+        if vcodec in ("auto", ""):
+            vcodec = "h264"
+        if acodec in ("auto", ""):
+            acodec = "aac"
+
+        def map_v():
+            if vcodec == "copy":
+                return ["-c:v", "copy"]
+            if c == "webm":
+                if vcodec in ("vp9", "libvpx-vp9"):
+                    return ["-c:v", "libvpx-vp9"]
+                if vcodec in ("vp8", "libvpx"):
+                    return ["-c:v", "libvpx"]
+                return ["-c:v", "libvpx-vp9"]
+            if vcodec in ("h264", "libx264"):
+                return ["-c:v", "libx264"]
+            return ["-c:v", "libx264"]
+
+        def map_a():
+            if acodec == "copy":
+                return ["-c:a", "copy"]
+            if c == "webm":
+                if acodec in ("opus", "libopus"):
+                    return ["-c:a", "libopus"]
+                if acodec in ("vorbis", "libvorbis"):
+                    return ["-c:a", "libvorbis"]
+                return ["-c:a", "libopus"]
+            if acodec in ("aac",):
+                return ["-c:a", "aac"]
+            return ["-c:a", "aac"]
+
+        return map_v(), map_a()
+
+    def _ffmpeg_args_for_audio_container(self, container, bitrate_kbps):
+        c = (container or "").strip().lower()
+        br = int(bitrate_kbps or 128)
+
+        if c == "mp3":
+            return ["-c:a", "libmp3lame", "-b:a", f"{br}k"]
+        if c == "ogg":
+            return ["-c:a", "libvorbis", "-b:a", f"{br}k"]
+        # m4a is extension; codec args still fine
+        return ["-c:a", "aac", "-b:a", f"{br}k"]
+
+    def _encode_video_variant(self, v, variant_id, duration_sec, on_variant_progress):
+        label = v.get("label") or ""
+        height = int(v.get("height") or 0)
+        vcodec = (v.get("vcodec") or "h264").lower() or "h264"
+        acodec = (v.get("acodec") or "aac").lower() or "aac"
+        container = (v.get("container") or "mp4").lower() or "mp4"
+
+        filename = f"v_{height}p.{container}" if height > 0 else f"v_source.{container}"
+        out_path = os.path.join(self.results_dir, filename)
+
+        vf = f"scale=-2:{height}" if height > 0 else None
+
+        ffmpeg = self.cfg["ffmpeg_bin"]
+        args = [ffmpeg, "-y", "-hide_banner", "-nostats", "-loglevel", "error", "-i", self.src_path]
+
+        if vf:
+            args += ["-vf", vf]
+
+        v_args, a_args = self._ffmpeg_codecs_for_video_container(container, vcodec, acodec)
+        args += v_args
+        args += a_args
+
+        muxer = _ffmpeg_muxer_for_container(container)
+        if muxer:
+            args += ["-f", muxer]
+
+        args += ["-progress", "pipe:1", out_path]
+
+        self._run_ffmpeg_with_progress(args, duration_sec, on_variant_progress)
+
+        mime = self._guess_mime_for_container("video", container)
+        art = self._make_artifact_ref("main", filename, mime, out_path, {"variant_id": variant_id, "container": container, "muxer": muxer})
+        self._set_variant_result(variant_id, label, [art])
+
+    def _encode_audio_variant(self, v, variant_id, duration_sec, on_variant_progress):
+        label = v.get("label") or ""
+        bitrate = int(v.get("audio_bitrate_kbps") or 128)
+        container = (v.get("container") or "m4a").lower() or "m4a"
+
+        filename = f"a_{bitrate}k.{container}"
+        out_path = os.path.join(self.results_dir, filename)
+
+        ffmpeg = self.cfg["ffmpeg_bin"]
+        args = [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-nostats",
+            "-loglevel",
+            "error",
+            "-i",
+            self.src_path,
+            "-vn",
+        ]
+        args += self._ffmpeg_args_for_audio_container(container, bitrate)
+
+        # IMPORTANT FIX: m4a is not a muxer; use mp4 muxer (or omit -f).
+        muxer = _ffmpeg_muxer_for_container(container)
+        if muxer:
+            args += ["-f", muxer]
+
+        args += ["-progress", "pipe:1", out_path]
+
+        self._run_ffmpeg_with_progress(args, duration_sec, on_variant_progress)
+
+        mime = self._guess_mime_for_container("audio", container)
+        art = self._make_artifact_ref(
+            "main",
+            filename,
+            mime,
+            out_path,
+            {"bitrate_kbps": bitrate, "variant_id": variant_id, "container": container, "muxer": muxer},
+        )
+        self._set_variant_result(variant_id, label, [art])
+
+    def _make_artifact_ref(self, artifact_id, filename, mime, path, meta=None):
+        st = os.stat(path)
+        digest = sha256_file(path)
+        return {
+            "artifact_id": artifact_id,
+            "filename": filename,
+            "mime": mime,
+            "size_bytes": int(st.st_size),
+            "sha256": digest.hex(),
+            "meta": meta or {},
+            "path": path,
+            "rel_path": "",
+        }
+
+    def _set_variant_result(self, variant_id, label, artifacts):
+        results = self.results_by_variant_id
+        results[variant_id] = {
+            "variant_id": variant_id,
+            "label": label or "",
+            "artifacts": artifacts or [],
+            "meta": {},
+        }
+        self._hset_json("results_by_variant_id_json", results)
+        self._persist_results_index()
+
     def _run_convert(self):
         try:
-            self._set_state(STATE_RUNNING, percent=0, message="running", meta={"stage": "PROBE"})
+            self._set_state(STATE_RUNNING, percent=0, message="running", meta={"stage": "DOWNLOAD"})
 
-            if not os.path.exists(self.src_path) or os.path.getsize(self.src_path) == 0:
-                self._fail("NO_SOURCE", "No uploaded source", {})
+            src = self.source
+            out = self.output
+            src_storage = (src.get("storage") or {})
+            out_storage = (out.get("storage") or {})
+
+            src_addr = _storage_addr(src_storage)
+            src_tls = bool(src_storage.get("tls") or False)
+            src_token = str(src_storage.get("token") or "")
+            src_rel = str(src.get("rel_path") or "")
+
+            out_addr = _storage_addr(out_storage)
+            out_tls = bool(out_storage.get("tls") or False)
+            out_token = str(out_storage.get("token") or "")
+            out_base = str(out.get("base_rel_dir") or "")
+
+            self.logger.info(
+                "job %s: STORAGE src_addr=%s src_rel=%s out_addr=%s out_base=%s tls=%s",
+                self.job_id,
+                src_addr,
+                src_rel,
+                out_addr,
+                out_base,
+                bool(src_tls or out_tls),
+            )
+
+            if not src_addr or not src_rel:
+                self._fail("BAD_REQUEST", "missing source storage ref", {"source": src})
+                return
+            if not out_addr or not out_base:
+                self._fail("BAD_REQUEST", "missing output storage ref", {"output": out})
                 return
 
+            self.logger.info("job %s: DOWNLOAD start rel=%s -> %s", self.job_id, src_rel, self.src_path)
+            bytes_dl = _download_from_storage(src_addr, src_tls, src_token, src_rel, self.src_path, self.logger, self.job_id)
+            self.logger.info("job %s: DOWNLOAD done bytes=%d", self.job_id, int(bytes_dl))
+
+            self._publish_progress(2, {"stage": "PROBE"})
             duration_sec = self._probe_duration_sec()
             self._hset({"duration_sec": str(duration_sec)})
 
@@ -485,7 +941,6 @@ class RedisConvertJob:
             task_progress = []
             for v in variants:
                 kind = int(v.get("kind") or 0)
-                # weight rule: video=1.0, audio=0.3
                 w = 1.0
                 if kind == 2:
                     w = 0.3
@@ -532,7 +987,7 @@ class RedisConvertJob:
                 v2["audio_bitrate_kbps"] = abr
                 v2["kind"] = kind
 
-                stage_meta = {"stage": "ENCODE", "variant": variant_id}
+                stage_meta = {"stage": "ENCODE", "variant": variant_id, "total_variants": total}
                 self._set_state(
                     STATE_RUNNING,
                     percent=self._calc_job_percent(task_progress, task_weights),
@@ -553,16 +1008,11 @@ class RedisConvertJob:
                 def on_variant_progress(vpct, extra_meta):
                     task_progress[idx] = vpct
                     jobpct = self._calc_job_percent(task_progress, task_weights)
-
-                    meta2 = {"stage": "ENCODE", "variant": variant_id}
+                    meta2 = {"stage": "ENCODE", "variant": variant_id, "variant_percent": int(vpct), "duration_sec": float(duration_sec)}
                     meta2.update(extra_meta or {})
-                    meta2["variant_percent"] = int(vpct)
-                    meta2["duration_sec"] = float(duration_sec)
-
                     self._publish_progress(jobpct, meta2)
 
-                if kind == 2 or (container in ("m4a", "mp3") and kind != 1):
-                    # audio: treat progress as 0->100 but push updates based on time if possible
+                if kind == 2:
                     self._encode_audio_variant(v2, variant_id, duration_sec, on_variant_progress)
                 else:
                     self._encode_video_variant(v2, variant_id, duration_sec, on_variant_progress)
@@ -570,440 +1020,47 @@ class RedisConvertJob:
                 task_progress[idx] = 100
                 self._mark_variant_ready(variant_id)
                 self._publish_progress(self._calc_job_percent(task_progress, task_weights), {"stage": "ENCODE", "variant": variant_id})
-
                 self.logger.info("job %s: ENCODE done variant_id=%s", self.job_id, variant_id)
 
+            self._publish_progress(99, {"stage": "UPLOAD"})
+            self.logger.info("job %s: UPLOAD start base=%s", self.job_id, out_base)
+
+            _mkdirs_storage(out_addr, out_tls, out_token, out_base)
+
+            results = self.results_by_variant_id or {}
+            for variant_id, vr in results.items():
+                arts = vr.get("artifacts") or []
+                for a in arts:
+                    local_path = a.get("path")
+                    fname = a.get("filename") or ""
+                    if not local_path or not os.path.exists(local_path):
+                        self._fail("INTERNAL", "local artifact missing before upload", {"variant_id": variant_id, "path": local_path})
+                        return
+                    if not fname:
+                        fname = os.path.basename(local_path)
+
+                    out_rel_path = _join_rel(out_base, fname)
+
+                    self.logger.info(
+                        "job %s: UPLOAD file variant=%s rel=%s size=%d",
+                        self.job_id,
+                        variant_id,
+                        out_rel_path,
+                        int(a.get("size_bytes") or 0),
+                    )
+
+                    bytes_up = _upload_file_to_storage(out_addr, out_tls, out_token, out_rel_path, local_path)
+                    a["rel_path"] = out_rel_path
+                    a["meta"] = dict(a.get("meta") or {})
+                    a["meta"]["uploaded_bytes"] = int(bytes_up)
+
+                self._set_variant_result(variant_id, vr.get("label") or "", arts)
+
+            self.logger.info("job %s: UPLOAD done", self.job_id)
             self._done()
 
         except Exception as e:
             tb = traceback.format_exc()[-4000:]
             self._fail("INTERNAL", "Unhandled exception in worker", {"exception": str(e), "traceback": tb})
-
-    def _publish_progress(self, job_percent, meta):
-        now_mono = time.monotonic()
-        job_percent = clamp_int(job_percent, 0, 99) if self.state == STATE_RUNNING else clamp_int(job_percent, 0, 100)
-
-        # throttle: at most once per 0.8s OR if percent changed by >=1
-        if (now_mono - self._last_progress_ts) < 0.8 and job_percent == self._last_job_percent:
-            return
-
-        self._last_progress_ts = now_mono
-        self._last_job_percent = job_percent
-
-        self._set_state(self.state, percent=job_percent, message="encoding", meta=meta or {})
-
-    def _calc_job_percent(self, progresses, weights):
-        if not progresses:
-            return 0
-        if not weights or len(weights) != len(progresses):
-            return clamp_int(sum(progresses) / max(len(progresses), 1), 0, 100)
-
-        sw = float(sum(weights)) if weights else 1.0
-        if sw <= 0:
-            sw = 1.0
-        acc = 0.0
-        for p, w in zip(progresses, weights):
-            acc += float(p) * float(w)
-        return clamp_int(acc / sw, 0, 100)
-
-    def _mark_variant_ready(self, variant_id):
-        ready = sorted(list(self.ready_variant_ids.union({variant_id})))
-        self._hset_json("ready_variant_ids_json", ready)
-        self._persist_results_index()
-
-    def _probe_duration_sec(self):
-        ffprobe = self.cfg["ffprobe_bin"]
-        args = [
-            ffprobe,
-            "-v", "error",
-            "-show_format",
-            "-show_streams",
-            "-of", "json",
-            self.src_path,
-        ]
-        code, out, err = run_cmd_capture(args, cwd=self.workdir)
-        if code != 0:
-            self._fail("FFPROBE_FAILED", "ffprobe failed", {"exit_code": code, "stderr": (err or "")[-4000:]})
-            raise RuntimeError("ffprobe failed")
-
-        try:
-            info = json.loads(out) if out else {}
-        except Exception:
-            info = {}
-
-        duration_sec = 0.0
-        fmt = info.get("format") or {}
-        duration_str = fmt.get("duration")
-        duration_sec = _f(duration_str, 0.0)
-
-        if duration_sec <= 0:
-            streams = info.get("streams") or []
-            for s in streams:
-                d = _f(s.get("duration"), 0.0)
-                if d > duration_sec:
-                    duration_sec = d
-
-        duration_sec = float(duration_sec or 0.0)
-        if duration_sec <= 0:
-            duration_sec = 1.0
-
-        meta = {"stage": "PROBE", "ffprobe": info}
-        self._set_state(self.state, percent=self.percent, message=self.message, meta=meta)
-        self.logger.info("job %s: PROBE ok duration_sec=%.3f", self.job_id, duration_sec)
-        return duration_sec
-
-    def _run_ffmpeg_with_progress(self, args, duration_sec, on_progress):
-        p = subprocess.Popen(
-            args,
-            cwd=self.workdir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            universal_newlines=True,
-        )
-
-        out_time_ms = 0
-        speed = ""
-        last_vpct = -1
-
-        def emit(vpct):
-            nonlocal last_vpct
-            vpct = clamp_int(vpct, 0, 100)
-            if vpct == last_vpct:
-                return
-            last_vpct = vpct
-            if on_progress:
-                on_progress(vpct, {"current_out_time_sec": float(out_time_ms) / 1_000_000.0, "speed": speed})
-
-        try:
-            for line in p.stdout:
-                line = (line or "").strip()
-                if not line or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                k = k.strip()
-                v = v.strip()
-
-                if k == "out_time_ms":
-                    try:
-                        out_time_ms = int(v)
-                    except Exception:
-                        out_time_ms = 0
-                    out_sec = float(out_time_ms) / 1_000_000.0
-                    vpct = int((out_sec / float(duration_sec)) * 100.0)
-                    vpct = clamp_int(vpct, 0, 99)
-                    emit(vpct)
-
-                elif k == "speed":
-                    speed = v
-
-                elif k == "progress" and v == "end":
-                    emit(100)
-
         finally:
-            rc = p.wait()
-            stderr = ""
-            try:
-                if p.stderr:
-                    stderr = p.stderr.read() or ""
-            except Exception:
-                stderr = ""
-            if rc != 0:
-                raise RuntimeError(stderr[-4000:])
-
-    def _encode_video_variant(self, v, variant_id, duration_sec, on_variant_progress):
-        label = v.get("label") or ""
-        height = int(v.get("height") or 0)
-        vcodec = (v.get("vcodec") or "h264").lower() or "h264"
-        acodec = (v.get("acodec") or "aac").lower() or "aac"
-        container = (v.get("container") or "mp4").lower() or "mp4"
-
-        if container != "mp4":
-            container = "mp4"
-        if vcodec in ("auto", ""):
-            vcodec = "h264"
-        if acodec in ("auto", ""):
-            acodec = "aac"
-
-        filename = f"v_{height}p.mp4" if height > 0 else "v_source.mp4"
-        out_path = os.path.join(self.results_dir, filename)
-
-        vf = f"scale=-2:{height}" if height > 0 else None
-
-        ffmpeg = self.cfg["ffmpeg_bin"]
-        args = [ffmpeg, "-y", "-hide_banner", "-nostats", "-loglevel", "error", "-i", self.src_path]
-
-        if vf:
-            args += ["-vf", vf]
-
-        args += ["-c:v", "libx264"] if vcodec == "h264" else ["-c:v", "copy"] if vcodec == "copy" else ["-c:v", "libx264"]
-        args += ["-c:a", "aac"] if acodec == "aac" else ["-c:a", "copy"] if acodec == "copy" else ["-c:a", "aac"]
-
-        args += ["-progress", "pipe:1", out_path]
-
-        self._run_ffmpeg_with_progress(args, duration_sec, on_variant_progress)
-
-        art = self._make_artifact_ref("main", filename, "video/mp4", out_path, {"variant_id": variant_id})
-        self._set_variant_result(variant_id, label, [art])
-
-    def _encode_audio_variant(self, v, variant_id, duration_sec, on_variant_progress):
-        label = v.get("label") or ""
-        bitrate = int(v.get("audio_bitrate_kbps") or 128)
-        container = (v.get("container") or "m4a").lower() or "m4a"
-        if container != "m4a":
-            container = "m4a"
-
-        filename = f"a_{bitrate}k.m4a"
-        out_path = os.path.join(self.results_dir, filename)
-
-        ffmpeg = self.cfg["ffmpeg_bin"]
-        args = [
-            ffmpeg,
-            "-y",
-            "-hide_banner",
-            "-nostats",
-            "-loglevel",
-            "error",
-            "-i",
-            self.src_path,
-            "-vn",
-            "-c:a",
-            "aac",
-            "-b:a",
-            f"{bitrate}k",
-            "-progress",
-            "pipe:1",
-            out_path,
-        ]
-
-        self._run_ffmpeg_with_progress(args, duration_sec, on_variant_progress)
-
-        art = self._make_artifact_ref("main", filename, "audio/mp4", out_path, {"bitrate_kbps": bitrate, "variant_id": variant_id})
-        self._set_variant_result(variant_id, label, [art])
-
-    def _make_artifact_ref(self, artifact_id, filename, mime, path, meta=None):
-        st = os.stat(path)
-        digest = sha256_file(path)
-        return {
-            "artifact_id": artifact_id,
-            "filename": filename,
-            "mime": mime,
-            "size_bytes": int(st.st_size),
-            "sha256": digest.hex(),
-            "inline_bytes": "",
-            "meta": meta or {},
-            "path": path,
-        }
-
-    def _set_variant_result(self, variant_id, label, artifacts):
-        results = self.results_by_variant_id
-        results[variant_id] = {
-            "variant_id": variant_id,
-            "label": label or "",
-            "artifacts": artifacts or [],
-            "meta": {},
-        }
-        self._hset_json("results_by_variant_id_json", results)
-        self._persist_results_index()
-
-    def _persist_results_index(self):
-        idx = {
-            "job_id": self.job_id,
-            "video_id": self.video_id,
-            "results_by_variant_id": self.results_by_variant_id,
-            "ready_variant_ids": sorted(list(self.ready_variant_ids)),
-        }
-        try:
-            with open(self.results_index_path, "w", encoding="utf-8") as f:
-                json.dump(idx, f)
-        except Exception:
             pass
-
-####################
-    def _guess_mime_for_container(self, kind, container):
-        """
-        kind: "video" or "audio"
-        container: lower-case container/extension like "mp4", "webm", "mp3", "ogg", "m4a"
-        """
-        c = (container or "").strip().lower()
-
-        if kind == "video":
-            if c == "mp4":
-                return "video/mp4"
-            if c == "webm":
-                return "video/webm"
-            if c == "mkv":
-                return "video/x-matroska"
-            if c == "mov":
-                return "video/quicktime"
-            # fallback
-            return f"video/{c}" if c else "video/mp4"
-
-        # audio
-        if c == "mp3":
-            return "audio/mpeg"
-        if c == "ogg":
-            return "audio/ogg"
-        if c == "m4a":
-            # m4a is mp4 container with audio-only
-            return "audio/mp4"
-        if c == "wav":
-            return "audio/wav"
-        if c == "flac":
-            return "audio/flac"
-        # fallback
-        return f"audio/{c}" if c else "audio/mp4"
-
-    def _ffmpeg_codecs_for_video_container(self, container, vcodec, acodec):
-        """
-        Returns (v_args, a_args) lists to append to ffmpeg cmd.
-        Goal: respect requested container; keep behavior stable by defaulting to sane codecs.
-        """
-        c = (container or "").strip().lower()
-        vcodec = (vcodec or "h264").strip().lower()
-        acodec = (acodec or "aac").strip().lower()
-
-        if vcodec in ("auto", ""):
-            vcodec = "h264"
-        if acodec in ("auto", ""):
-            acodec = "aac"
-
-        # If user explicitly asked for copy - keep.
-        def map_v():
-            if vcodec == "copy":
-                return ["-c:v", "copy"]
-            if c == "webm":
-                # webm: vp9/vp8 are typical. We'll use libvpx-vp9 by default.
-                if vcodec in ("vp9", "libvpx-vp9"):
-                    return ["-c:v", "libvpx-vp9"]
-                if vcodec in ("vp8", "libvpx"):
-                    return ["-c:v", "libvpx"]
-                # fallback for webm:
-                return ["-c:v", "libvpx-vp9"]
-            # mp4 (and fallback): h264 default
-            if vcodec in ("h264", "libx264"):
-                return ["-c:v", "libx264"]
-            return ["-c:v", "libx264"]
-
-        def map_a():
-            if acodec == "copy":
-                return ["-c:a", "copy"]
-            if c == "webm":
-                # webm: opus/vorbis typical
-                if acodec in ("opus", "libopus"):
-                    return ["-c:a", "libopus"]
-                if acodec in ("vorbis", "libvorbis"):
-                    return ["-c:a", "libvorbis"]
-                # fallback for webm:
-                return ["-c:a", "libopus"]
-            # mp4 (and fallback): aac default
-            if acodec in ("aac",):
-                return ["-c:a", "aac"]
-            return ["-c:a", "aac"]
-
-        return map_v(), map_a()
-
-    def _ffmpeg_args_for_audio_container(self, container, bitrate_kbps):
-        """
-        Returns list of ffmpeg args for audio encoding (no video).
-        """
-        c = (container or "").strip().lower()
-        br = int(bitrate_kbps or 128)
-
-        # Note: keep it simple and predictable. If later you want passthrough/codec selection,
-        # you can extend variant options.
-        if c == "mp3":
-            return ["-c:a", "libmp3lame", "-b:a", f"{br}k"]
-        if c == "ogg":
-            # ogg typically uses libvorbis; bitrate mode is ok here.
-            return ["-c:a", "libvorbis", "-b:a", f"{br}k"]
-        if c == "m4a":
-            return ["-c:a", "aac", "-b:a", f"{br}k"]
-        # fallback: keep old behavior (aac in mp4/m4a-like), but preserve extension container
-        return ["-c:a", "aac", "-b:a", f"{br}k"]
-
-    def _encode_video_variant(self, v, variant_id, duration_sec, on_variant_progress):
-        label = v.get("label") or ""
-        height = int(v.get("height") or 0)
-        vcodec = (v.get("vcodec") or "h264").lower() or "h264"
-        acodec = (v.get("acodec") or "aac").lower() or "aac"
-        container = (v.get("container") or "mp4").lower() or "mp4"
-
-        # IMPORTANT: do NOT force container to mp4. Respect request.
-        # Filename must match container to avoid overwrites on client side.
-        # Include container in name so v_720p.mp4 and v_720p.webm are different.
-        if height > 0:
-            filename = f"v_{height}p.{container}"
-        else:
-            filename = f"v_source.{container}"
-
-        out_path = os.path.join(self.results_dir, filename)
-
-        vf = f"scale=-2:{height}" if height > 0 else None
-
-        ffmpeg = self.cfg["ffmpeg_bin"]
-        args = [ffmpeg, "-y", "-hide_banner", "-nostats", "-loglevel", "error", "-i", self.src_path]
-
-        if vf:
-            args += ["-vf", vf]
-
-        v_args, a_args = self._ffmpeg_codecs_for_video_container(container, vcodec, acodec)
-        args += v_args
-        args += a_args
-
-        # Explicitly set container format for ffmpeg to avoid ambiguity
-        # (especially when writing to a path with extension).
-        args += ["-f", container]
-
-        args += ["-progress", "pipe:1", out_path]
-
-        self._run_ffmpeg_with_progress(args, duration_sec, on_variant_progress)
-
-        mime = self._guess_mime_for_container("video", container)
-        art = self._make_artifact_ref("main", filename, mime, out_path, {"variant_id": variant_id, "container": container})
-        self._set_variant_result(variant_id, label, [art])
-
-    def _encode_audio_variant(self, v, variant_id, duration_sec, on_variant_progress):
-        label = v.get("label") or ""
-        bitrate = int(v.get("audio_bitrate_kbps") or 128)
-        container = (v.get("container") or "m4a").lower() or "m4a"
-
-        # IMPORTANT: do NOT force container to m4a. Respect request.
-        # Include container in filename to prevent overwrites.
-        filename = f"a_{bitrate}k.{container}"
-        out_path = os.path.join(self.results_dir, filename)
-
-        ffmpeg = self.cfg["ffmpeg_bin"]
-
-        args = [
-            ffmpeg,
-            "-y",
-            "-hide_banner",
-            "-nostats",
-            "-loglevel",
-            "error",
-            "-i",
-            self.src_path,
-            "-vn",
-        ]
-
-        args += self._ffmpeg_args_for_audio_container(container, bitrate)
-
-        # Explicit container format (helps for ogg/mp3)
-        args += ["-f", container]
-
-        args += ["-progress", "pipe:1", out_path]
-
-        self._run_ffmpeg_with_progress(args, duration_sec, on_variant_progress)
-
-        mime = self._guess_mime_for_container("audio", container)
-        art = self._make_artifact_ref(
-            "main",
-            filename,
-            mime,
-            out_path,
-            {"bitrate_kbps": bitrate, "variant_id": variant_id, "container": container},
-        )
-        self._set_variant_result(variant_id, label, [art])
-

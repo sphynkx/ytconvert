@@ -1,0 +1,220 @@
+syntax = "proto3";
+
+package ytstorage;
+
+
+// Types
+
+enum FileType {
+  FILETYPE_UNKNOWN = 0;
+  FILETYPE_FILE = 1;
+  FILETYPE_DIR = 2;
+  FILETYPE_SYMLINK = 3;
+}
+
+message Path {
+  string rel_path = 1; // normalized, no leading slash
+}
+
+message StatRequest {
+  Path path = 1;
+}
+
+message StatResponse {
+  string name = 1;
+  string rel_path = 2;
+  FileType file_type = 3;
+  int64 size_bytes = 4;
+  int64 created_at_ms = 5;
+  int64 updated_at_ms = 6;
+  string etag = 7; // optional
+}
+
+message ExistsRequest {
+  Path path = 1;
+}
+
+message ExistsResponse {
+  bool exists = 1;
+  FileType file_type = 2;
+}
+
+message MkdirsRequest {
+  Path path = 1;
+  bool exist_ok = 2; // true = no error if exists
+}
+
+message MkdirsResponse {
+  bool ok = 1;
+}
+
+message ListdirRequest {
+  Path path = 1;
+  bool recursive = 2; // optional
+  int32 limit = 3;    // pagination
+  string page_token = 4;
+}
+
+message FileEntry {
+  string name = 1;
+  string rel_path = 2;
+  FileType file_type = 3;
+  int64 size_bytes = 4;
+  int64 created_at_ms = 5;
+  int64 updated_at_ms = 6;
+}
+
+message ListdirResponse {
+  repeated FileEntry entries = 1;
+  string next_page_token = 2;
+}
+
+message RenameRequest {
+  Path src = 1;
+  Path dst = 2;
+  bool overwrite = 3;
+}
+
+message RenameResponse {
+  bool ok = 1;
+}
+
+message RemoveRequest {
+  Path path = 1;
+  bool recursive = 2;
+}
+
+message RemoveResponse {
+  bool ok = 1;
+}
+
+// Streaming read
+message ReadRequest {
+  Path path = 1;
+  int64 offset = 2;      // optional start offset
+  int64 length = 3;      // optional max bytes (-1 for full)
+}
+
+message ReadChunk {
+  bytes data = 1;
+}
+
+// Bidirectional streaming write with header + chunks + ack
+message WriteHeader {
+  Path path = 1;
+  bool overwrite = 2;
+  bool append = 3;
+  int64 expected_size = 4; // optional
+  string etag = 5;         // optional desired etag/hash
+}
+
+message WriteData {
+  bytes data = 1;
+}
+
+message WriteAck {
+  bool ok = 1;
+  int64 bytes_written = 2;
+  string etag = 3; // computed by server if available
+  string error = 4;
+}
+
+message WriteEnvelope {
+  oneof kind {
+    WriteHeader header = 1;
+    WriteData data = 2;
+  }
+}
+
+// Health
+message HealthRequest {}
+message HealthResponse {
+  string status = 1; // "ok"
+  string version = 2;
+}
+
+// --- NEW: URL Generation ---
+
+enum UrlMethod {
+    URL_METHOD_GET = 0;  // For downloading
+    URL_METHOD_PUT = 1;  // For uploading
+}
+
+message GenerateUrlRequest {
+    Path path = 1;
+    UrlMethod method = 2;
+    int32 expiration_seconds = 3; // e.g. 3600
+}
+
+message GenerateUrlResponse {
+    bool supported = 1;     // true if driver supports direct links
+    string url = 2;         // full http/https url
+    int64 expires_at_ms = 3;
+}
+
+// Jobs / queues for large transfers
+message EnqueuePutRequest {
+  Path path = 1;
+  bool overwrite = 2;
+  int64 expected_size = 3;
+}
+
+message EnqueueGetRequest {
+  Path path = 1;
+}
+
+message JobRef {
+  string job_id = 1;
+}
+
+enum JobStatusCode {
+  JOB_UNKNOWN = 0;
+  JOB_QUEUED = 1;
+  JOB_RUNNING = 2;
+  JOB_DONE = 3;
+  JOB_FAIL = 4;
+  JOB_CANCELLED = 5;
+}
+
+message JobStatusRequest {
+  string job_id = 1;
+}
+
+message JobStatusResponse {
+  JobStatusCode status = 1;
+  int32 percent = 2; // 0..100 or -1
+  int64 bytes_processed = 3;
+  string error = 4;
+}
+
+message CancelJobRequest {
+  string job_id = 1;
+}
+
+message CancelJobResponse {
+  bool ok = 1;
+}
+
+service StorageService {
+  rpc Health(HealthRequest) returns (HealthResponse);
+
+  rpc Stat(StatRequest) returns (StatResponse);
+  rpc Exists(ExistsRequest) returns (ExistsResponse);
+  rpc Mkdirs(MkdirsRequest) returns (MkdirsResponse);
+  rpc Listdir(ListdirRequest) returns (ListdirResponse);
+  rpc Rename(RenameRequest) returns (RenameResponse);
+  rpc Remove(RemoveRequest) returns (RemoveResponse);
+
+  // Streaming:
+  rpc Read(ReadRequest) returns (stream ReadChunk);
+  rpc Write(stream WriteEnvelope) returns (stream WriteAck);
+
+  // Direct Access:
+  rpc GeneratePresignedUrl(GenerateUrlRequest) returns (GenerateUrlResponse);
+
+  // Jobs / queues:
+  rpc EnqueuePut(EnqueuePutRequest) returns (JobRef);
+  rpc EnqueueGet(EnqueueGetRequest) returns (JobRef);
+  rpc JobStatus(JobStatusRequest) returns (JobStatusResponse);
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
+}

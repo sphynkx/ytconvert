@@ -43,11 +43,6 @@ class ConverterStub(object):
                 request_serializer=ytconvert__pb2.SubmitConvertRequest.SerializeToString,
                 response_deserializer=ytconvert__pb2.JobAck.FromString,
                 _registered_method=True)
-        self.UploadSource = channel.stream_unary(
-                '/ytconvert.v1.Converter/UploadSource',
-                request_serializer=ytconvert__pb2.UploadSourceChunk.SerializeToString,
-                response_deserializer=ytconvert__pb2.UploadAck.FromString,
-                _registered_method=True)
         self.GetStatus = channel.unary_unary(
                 '/ytconvert.v1.Converter/GetStatus',
                 request_serializer=ytconvert__pb2.GetStatusRequest.SerializeToString,
@@ -62,11 +57,6 @@ class ConverterStub(object):
                 '/ytconvert.v1.Converter/GetResult',
                 request_serializer=ytconvert__pb2.GetResultRequest.SerializeToString,
                 response_deserializer=ytconvert__pb2.ConvertResult.FromString,
-                _registered_method=True)
-        self.DownloadResult = channel.unary_stream(
-                '/ytconvert.v1.Converter/DownloadResult',
-                request_serializer=ytconvert__pb2.DownloadRequest.SerializeToString,
-                response_deserializer=ytconvert__pb2.DownloadChunk.FromString,
                 _registered_method=True)
         self.WatchJob = channel.unary_stream(
                 '/ytconvert.v1.Converter/WatchJob',
@@ -83,50 +73,31 @@ class ConverterServicer(object):
     """
 
     def SubmitConvert(self, request, context):
-        """Create a conversion job (no file data here).
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def UploadSource(self, request_iterator, context):
-        """Upload original file bytes (streaming). Must support resume with offset (best-effort).
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def GetStatus(self, request, context):
-        """Poll job state.
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def GetPartialResult(self, request, context):
-        """Partial progress while RUNNING/WAITING_UPLOAD; MUST NOT fail with FAILED_PRECONDITION for RUNNING.
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def GetResult(self, request, context):
-        """Final results (or error) once DONE/FAILED.
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def DownloadResult(self, request, context):
-        """Download a specific artifact as a byte stream (supports resume via offset).
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def WatchJob(self, request, context):
-        """Optional: server-stream events for a job (alternative to polling).
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -138,11 +109,6 @@ def add_ConverterServicer_to_server(servicer, server):
                     servicer.SubmitConvert,
                     request_deserializer=ytconvert__pb2.SubmitConvertRequest.FromString,
                     response_serializer=ytconvert__pb2.JobAck.SerializeToString,
-            ),
-            'UploadSource': grpc.stream_unary_rpc_method_handler(
-                    servicer.UploadSource,
-                    request_deserializer=ytconvert__pb2.UploadSourceChunk.FromString,
-                    response_serializer=ytconvert__pb2.UploadAck.SerializeToString,
             ),
             'GetStatus': grpc.unary_unary_rpc_method_handler(
                     servicer.GetStatus,
@@ -158,11 +124,6 @@ def add_ConverterServicer_to_server(servicer, server):
                     servicer.GetResult,
                     request_deserializer=ytconvert__pb2.GetResultRequest.FromString,
                     response_serializer=ytconvert__pb2.ConvertResult.SerializeToString,
-            ),
-            'DownloadResult': grpc.unary_stream_rpc_method_handler(
-                    servicer.DownloadResult,
-                    request_deserializer=ytconvert__pb2.DownloadRequest.FromString,
-                    response_serializer=ytconvert__pb2.DownloadChunk.SerializeToString,
             ),
             'WatchJob': grpc.unary_stream_rpc_method_handler(
                     servicer.WatchJob,
@@ -201,33 +162,6 @@ class Converter(object):
             '/ytconvert.v1.Converter/SubmitConvert',
             ytconvert__pb2.SubmitConvertRequest.SerializeToString,
             ytconvert__pb2.JobAck.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def UploadSource(request_iterator,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.stream_unary(
-            request_iterator,
-            target,
-            '/ytconvert.v1.Converter/UploadSource',
-            ytconvert__pb2.UploadSourceChunk.SerializeToString,
-            ytconvert__pb2.UploadAck.FromString,
             options,
             channel_credentials,
             insecure,
@@ -309,33 +243,6 @@ class Converter(object):
             '/ytconvert.v1.Converter/GetResult',
             ytconvert__pb2.GetResultRequest.SerializeToString,
             ytconvert__pb2.ConvertResult.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def DownloadResult(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_stream(
-            request,
-            target,
-            '/ytconvert.v1.Converter/DownloadResult',
-            ytconvert__pb2.DownloadRequest.SerializeToString,
-            ytconvert__pb2.DownloadChunk.FromString,
             options,
             channel_credentials,
             insecure,
